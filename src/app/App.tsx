@@ -103,7 +103,7 @@ interface TestMessage {
 
 // ─── PROVIDER DATA ────────────────────────────────────────────────────────────
 
-const STT_PROVIDERS: Record<string, { name: string; badge: string; models: { id: string; name: string }[] }> = {
+let STT_PROVIDERS: Record<string, { name: string; badge: string; models: { id: string; name: string }[] }> = {
   openai: {
     name: "OpenAI Whisper", badge: "OAI",
     models: [{ id: "whisper-1", name: "Whisper-1" }, { id: "whisper-large-v3", name: "Whisper Large v3" }],
@@ -131,7 +131,7 @@ const STT_PROVIDERS: Record<string, { name: string; badge: string; models: { id:
   },
 };
 
-const LLM_PROVIDERS: Record<string, { name: string; badge: string; models: { id: string; name: string; context: string }[] }> = {
+let LLM_PROVIDERS: Record<string, { name: string; badge: string; models: { id: string; name: string; context: string }[] }> = {
   openai: {
     name: "OpenAI", badge: "OAI",
     models: [
@@ -176,7 +176,7 @@ const LLM_PROVIDERS: Record<string, { name: string; badge: string; models: { id:
 };
 
 interface VoiceOption { id: string; name: string; gender: string; accent: string; style: string }
-const TTS_PROVIDERS: Record<string, {
+let TTS_PROVIDERS: Record<string, {
   name: string; badge: string;
   models: { id: string; name: string }[];
   voices: Record<string, VoiceOption[]>;
@@ -313,6 +313,49 @@ const TTS_PROVIDERS: Record<string, {
   },
 };
 
+function applyProviderCatalog(catalog: {
+  stt: { id: string; name: string; models?: string[] }[];
+  llm: { id: string; name: string; models?: string[] }[];
+  tts: { id: string; name: string; models?: string[]; voices?: string[] }[];
+}) {
+  STT_PROVIDERS = Object.fromEntries(catalog.stt.map(provider => [provider.id, {
+    name: provider.name,
+    badge: provider.id.toUpperCase().slice(0, 3),
+    models: (provider.models || []).map(id => ({ id, name: id })),
+  }]));
+
+  LLM_PROVIDERS = Object.fromEntries(catalog.llm.map(provider => [provider.id, {
+    name: provider.name,
+    badge: provider.id.toUpperCase().slice(0, 3),
+    models: (provider.models || []).map(id => ({ id, name: id, context: "" })),
+  }]));
+
+  TTS_PROVIDERS = Object.fromEntries(catalog.tts.map(provider => [provider.id, {
+    name: provider.name,
+    badge: provider.id.toUpperCase().slice(0, 3),
+    models: (provider.models || []).map(id => ({ id, name: id })),
+    voices: (provider.models || []).reduce<Record<string, VoiceOption[]>>((voices, model) => {
+      voices[model] = (provider.voices || []).map(id => ({
+        id,
+        name: id,
+        gender: "",
+        accent: "",
+        style: "",
+      }));
+      return voices;
+    }, {}),
+  }]));
+}
+
+applyProviderCatalog({
+  stt: [{ id: "sarvam", name: "Sarvam Streaming", models: ["saaras:v3"] }],
+  llm: [{ id: "perplexity", name: "Perplexity Sonar", models: ["sonar"] }],
+  tts: [
+    { id: "piper", name: "Piper", models: [], voices: [] },
+    { id: "sarvam", name: "Sarvam Streaming", models: ["bulbul:v3"], voices: ["rahul"] },
+  ],
+});
+
 const AVAILABLE_TOOLS = [
   { id: "calendar", name: "Calendar & Scheduling", icon: Calendar, description: "Book meetings, check availability, manage appointments", badge: "Popular" },
   { id: "crm", name: "CRM Integration", icon: User, description: "Sync contacts, log calls, update records in Salesforce/HubSpot", badge: "" },
@@ -341,10 +384,10 @@ const defaultForm: AgentForm = {
   name: "", description: "", agentType: "customer-support", purpose: "",
   systemInstructions: "You are a helpful, knowledgeable AI voice assistant. Be concise, friendly, and stay on topic. If you don't know something, say so honestly.",
   personality: "friendly", tone: "warm", conversationStyle: "conversational", goals: "",
-  sttProvider: "deepgram", sttModel: "nova-2",
-  llmProvider: "openai", llmModel: "gpt-4o", llmTemperature: 0.7, llmMaxTokens: 512,
-  ttsProvider: "elevenlabs", ttsModel: "eleven_multilingual_v2",
-  voice: "rachel", language: "en", accent: "american", speakingSpeed: 1.0, pitch: 0, voiceStyle: "conversational",
+  sttProvider: "sarvam", sttModel: "saaras:v3",
+  llmProvider: "perplexity", llmModel: "sonar", llmTemperature: 0.7, llmMaxTokens: 512,
+  ttsProvider: "sarvam", ttsModel: "bulbul:v3",
+  voice: "rahul", language: "en", accent: "american", speakingSpeed: 1.0, pitch: 0, voiceStyle: "conversational",
   knowledgeSources: [],
   greeting: "Hi there! How can I help you today?", fallbackMessage: "I'm sorry, I didn't catch that. Could you say that again?",
   fallbackBehavior: "ask-again", interruptionHandling: "pause-and-listen",
@@ -364,6 +407,7 @@ function cn(...classes: (string | boolean | undefined)[]) {
 }
 
 const API_BASE_URL = "http://localhost:8000";
+const WS_URL = "ws://localhost:8000/ws";
 
 async function apiRequest(path: string, options: RequestInit = {}) {
   const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -664,7 +708,7 @@ function AIModelsStep({ form, onChange }: StepProps) {
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-4">
           {Object.entries(STT_PROVIDERS).map(([id, p]) => (
             <ProviderCard key={id} id={id} name={p.name} badge={p.badge} selected={form.sttProvider === id}
-              onClick={() => onChange({ sttProvider: id, sttModel: p.models[0].id })} />
+              onClick={() => onChange({ sttProvider: id, sttModel: p.models[0]?.id || "" })} />
           ))}
         </div>
         <div>
@@ -685,7 +729,7 @@ function AIModelsStep({ form, onChange }: StepProps) {
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-4">
           {Object.entries(LLM_PROVIDERS).map(([id, p]) => (
             <ProviderCard key={id} id={id} name={p.name} badge={p.badge} selected={form.llmProvider === id}
-              onClick={() => onChange({ llmProvider: id, llmModel: p.models[0].id })} />
+              onClick={() => onChange({ llmProvider: id, llmModel: p.models[0]?.id || "" })} />
           ))}
         </div>
         <div className="grid grid-cols-2 gap-4">
@@ -721,7 +765,7 @@ function AIModelsStep({ form, onChange }: StepProps) {
           {Object.entries(TTS_PROVIDERS).map(([id, p]) => (
             <ProviderCard key={id} id={id} name={p.name} badge={p.badge} selected={form.ttsProvider === id}
               onClick={() => {
-                const firstModel = p.models[0].id;
+                const firstModel = p.models[0]?.id || "";
                 const firstVoice = p.voices[firstModel]?.[0]?.id || "";
                 onChange({ ttsProvider: id, ttsModel: firstModel, voice: firstVoice });
               }} />
@@ -1192,7 +1236,7 @@ const MOCK_RESPONSES = [
   "Absolutely! I can help you with that. Just to confirm, you're asking about the Pro plan pricing?",
 ];
 
-function TestStep({ form }: { form: AgentForm }) {
+function TestStep({ form, agentId }: { form: AgentForm; agentId?: string }) {
   const [messages, setMessages] = useState<TestMessage[]>([]);
   const [input, setInput] = useState("");
   const [isRecording, setIsRecording] = useState(false);
@@ -1215,18 +1259,26 @@ function TestStep({ form }: { form: AgentForm }) {
     setMessages(prev => [...prev, userMsg]);
     setInput("");
     setIsProcessing(true);
-    setPipeline("stt");
-    await new Promise(r => setTimeout(r, 400));
     setPipeline("llm");
-    await new Promise(r => setTimeout(r, 700));
-    setPipeline("tts");
-    await new Promise(r => setTimeout(r, 400));
-    const response = MOCK_RESPONSES[responseIdx.current % MOCK_RESPONSES.length];
-    responseIdx.current++;
-    const agentMsg: TestMessage = { id: (Date.now() + 1).toString(), role: "agent", content: response, timestamp: new Date().toLocaleTimeString(), latency: Math.floor(Math.random() * 600) + 400 };
-    setMessages(prev => [...prev, agentMsg]);
-    setIsProcessing(false);
-    setPipeline("idle");
+    if (!agentId) {
+      setMessages(prev => [...prev, { id: (Date.now() + 1).toString(), role: "agent", content: "Save and publish this agent before testing it.", timestamp: new Date().toLocaleTimeString() }]);
+      setIsProcessing(false);
+      setPipeline("idle");
+      return;
+    }
+    try {
+      const data = await apiRequest("/chat", {
+        method: "POST",
+        body: JSON.stringify({ agent_id: agentId, message: text }),
+      });
+      setMessages(prev => [...prev, { id: (Date.now() + 1).toString(), role: "agent", content: data.response, timestamp: new Date().toLocaleTimeString() }]);
+    } catch (error) {
+      console.error("Chat request failed:", error);
+      setMessages(prev => [...prev, { id: (Date.now() + 1).toString(), role: "agent", content: error instanceof Error ? error.message : "Chat request failed", timestamp: new Date().toLocaleTimeString() }]);
+    } finally {
+      setIsProcessing(false);
+      setPipeline("idle");
+    }
   };
 
   const toggleRecording = () => {
@@ -1490,7 +1542,7 @@ function AgentWizard({ initialForm, onBack, onSave, isEditing, editingId }: Wiza
     <ToolsStep key={5} form={form} onChange={onChange} />,
     <MemoryStep key={6} form={form} onChange={onChange} />,
     <SecurityStep key={7} form={form} onChange={onChange} />,
-    <TestStep key={8} form={form} />,
+    <TestStep key={8} form={form} agentId={editingId} />,
     <PublishStep key={9} form={form} onPublish={handlePublish} onSaveDraft={() => handleSave("draft")} />,
   ];
 
@@ -1636,7 +1688,7 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
   const [processing, setProcessing] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
-  const responseIdx = useRef(0);
+  const socketRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
     if (callActive) {
@@ -1649,43 +1701,61 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
+  useEffect(() => () => {
+    socketRef.current?.close();
+    void apiRequest("/stop", { method: "POST" }).catch(() => undefined);
+  }, []);
+
   const formatDuration = (s: number) => `${Math.floor(s / 60).toString().padStart(2, "0")}:${(s % 60).toString().padStart(2, "0")}`;
 
   const startCall = () => {
     setCallActive(true);
     setMessages([{ id: "0", role: "agent", content: "Hello! Thanks for calling. How can I assist you today?", timestamp: new Date().toLocaleTimeString() }]);
+
+    const socket = new WebSocket(WS_URL);
+    socketRef.current = socket;
+    socket.onmessage = event => {
+      const message = JSON.parse(event.data);
+      if (message.event === "transcript") {
+        setIsListening(false);
+        setProcessing(true);
+        setMessages(prev => [...prev, { id: `${Date.now()}-user`, role: "user", content: message.data.text, timestamp: new Date().toLocaleTimeString() }]);
+      }
+      if (message.event === "assistant") {
+        setProcessing(false);
+        setMessages(prev => [...prev, { id: `${Date.now()}-agent`, role: "agent", content: message.data.text, timestamp: new Date().toLocaleTimeString() }]);
+      }
+    };
+    socket.onopen = () => {
+      apiRequest("/start", {
+        method: "POST",
+        body: JSON.stringify({ agent_id: agent.id }),
+      }).catch(error => {
+        console.error("Audio session start failed:", error);
+        setCallActive(false);
+        setMessages(prev => [...prev, { id: `${Date.now()}-error`, role: "agent", content: error instanceof Error ? error.message : "Audio session start failed", timestamp: new Date().toLocaleTimeString() }]);
+      });
+    };
+    socket.onerror = () => {
+      setCallActive(false);
+      setProcessing(false);
+      setIsListening(false);
+    };
   };
 
   const endCall = () => {
     setCallActive(false);
     setIsListening(false);
+    setProcessing(false);
     setCallDuration(0);
+    socketRef.current?.close();
+    socketRef.current = null;
+    void apiRequest("/stop", { method: "POST" }).catch(error => console.error("Audio session stop failed:", error));
   };
 
   const handleMic = () => {
     if (!callActive || processing) return;
     setIsListening(true);
-    setTimeout(async () => {
-      setIsListening(false);
-      const userMessages = ["I need help with my account.", "What are your pricing plans?", "Can you help me with a refund?"];
-      const userMsg: TestMessage = {
-        id: Date.now().toString(), role: "user",
-        content: userMessages[responseIdx.current % userMessages.length],
-        timestamp: new Date().toLocaleTimeString()
-      };
-      setMessages(prev => [...prev, userMsg]);
-      setProcessing(true);
-      await new Promise(r => setTimeout(r, 1200));
-      const agentMsg: TestMessage = {
-        id: (Date.now() + 1).toString(), role: "agent",
-        content: MOCK_RESPONSES[responseIdx.current % MOCK_RESPONSES.length],
-        timestamp: new Date().toLocaleTimeString(),
-        latency: Math.floor(Math.random() * 500) + 350
-      };
-      responseIdx.current++;
-      setMessages(prev => [...prev, agentMsg]);
-      setProcessing(false);
-    }, 2000);
   };
 
   return (
@@ -2074,6 +2144,7 @@ export default function App() {
 
   const [view, setView] = useState<View>("dashboard");
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [, setProviderCatalogVersion] = useState(0);
   const [editingAgent, setEditingAgent] = useState<Agent | null>(null);
   const [useAgentTarget, setUseAgentTarget] = useState<Agent | null>(null);
 
@@ -2104,6 +2175,24 @@ export default function App() {
     subscription.unsubscribe();
   };
 }, []);
+
+  useEffect(() => {
+    let mounted = true;
+
+    apiRequest("/providers")
+      .then(data => {
+        if (!mounted) return;
+        applyProviderCatalog(data);
+        setProviderCatalogVersion(version => version + 1);
+      })
+      .catch(error => {
+        console.error("Failed to load providers:", error);
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!session) return;
