@@ -1689,6 +1689,8 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const socketRef = useRef<WebSocket | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const nextAudioTimeRef = useRef(0);
 
   useEffect(() => {
     if (callActive) {
@@ -1703,6 +1705,7 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
 
   useEffect(() => () => {
     socketRef.current?.close();
+    void audioContextRef.current?.close();
     void apiRequest("/stop", { method: "POST" }).catch(() => undefined);
   }, []);
 
@@ -1711,10 +1714,44 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
   const startCall = () => {
     setCallActive(true);
     setMessages([{ id: "0", role: "agent", content: "Hello! Thanks for calling. How can I assist you today?", timestamp: new Date().toLocaleTimeString() }]);
+    const audioContext = new AudioContext({ sampleRate: 16000 });
+    audioContextRef.current = audioContext;
+    console.log(`[BROWSER AUDIO] AudioContext created state=${audioContext.state} sampleRate=${audioContext.sampleRate}`);
+    void audioContext.resume().then(() => {
+      console.log(`[BROWSER AUDIO] AudioContext state after resume=${audioContext.state}`);
+    }).catch(error => {
+      console.error("[BROWSER AUDIO] AudioContext resume FAILED", error);
+    });
+    nextAudioTimeRef.current = audioContext.currentTime;
 
     const socket = new WebSocket(WS_URL);
     socketRef.current = socket;
+    socket.binaryType = "arraybuffer";
     socket.onmessage = event => {
+      if (event.data instanceof ArrayBuffer) {
+        const context = audioContextRef.current;
+        if (!context) return;
+        console.log(`[BROWSER AUDIO] websocket binary received bytes=${event.data.byteLength}`);
+        console.log(`[BROWSER AUDIO] decoding PCM bytes=${event.data.byteLength}`);
+        console.log(`[AUDIO] browser audio chunk received bytes=${event.data.byteLength}`);
+        const samples = new Int16Array(event.data);
+        const audioBuffer = context.createBuffer(1, samples.length, 16000);
+        const channel = audioBuffer.getChannelData(0);
+        for (let index = 0; index < samples.length; index += 1) {
+          channel[index] = samples[index] / 32768;
+        }
+        const source = context.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(context.destination);
+        console.log(`[BROWSER AUDIO] AudioBuffer created samples=${samples.length} duration=${audioBuffer.duration} sampleRate=${audioBuffer.sampleRate}`);
+        const startTime = Math.max(context.currentTime, nextAudioTimeRef.current);
+        console.log(`[BROWSER AUDIO] source.start startTime=${startTime} currentTime=${context.currentTime} duration=${audioBuffer.duration} state=${context.state}`);
+        source.start(startTime);
+        console.log("[BROWSER AUDIO] source.start COMPLETE");
+        nextAudioTimeRef.current = startTime + audioBuffer.duration;
+        console.log("[AUDIO] browser playback started");
+        return;
+      }
       const message = JSON.parse(event.data);
       if (message.event === "transcript") {
         setIsListening(false);
@@ -1740,6 +1777,8 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
       setCallActive(false);
       setProcessing(false);
       setIsListening(false);
+      void audioContext.close();
+      audioContextRef.current = null;
     };
   };
 
@@ -1750,6 +1789,8 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
     setCallDuration(0);
     socketRef.current?.close();
     socketRef.current = null;
+    void audioContextRef.current?.close();
+    audioContextRef.current = null;
     void apiRequest("/stop", { method: "POST" }).catch(error => console.error("Audio session stop failed:", error));
   };
 
