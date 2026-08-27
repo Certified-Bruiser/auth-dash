@@ -117,7 +117,7 @@ export default function PanelVisual({ view }: Props) {
           }}
         >
           {view === 'login' ? (
-            <>The future<br /><span style={{ color: '#8b6bff' }}>starts here.</span></>
+            <>The future of Voice Agents<br /><span style={{ color: '#8b6bff' }}>starts here.</span></>
           ) : (
             <>Build what<br /><span style={{ color: '#8b6bff' }}>matters most.</span></>
           )}
