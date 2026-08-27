@@ -101,6 +101,13 @@ interface TestMessage {
   latency?: number;
 }
 
+interface GeneratedPrompt {
+  purpose: string;
+  systemInstructions: string;
+  goals: string;
+  suggestions: string[];
+}
+
 // ─── PROVIDER DATA ────────────────────────────────────────────────────────────
 
 let STT_PROVIDERS: Record<string, { name: string; badge: string; models: { id: string; name: string }[] }> = {
@@ -604,9 +611,100 @@ function TagInput({ tags, onAdd, onRemove, placeholder }: {
 
 // ─── WIZARD STEPS ─────────────────────────────────────────────────────────────
 
-interface StepProps { form: AgentForm; onChange: (updates: Partial<AgentForm>) => void }
+interface StepProps { form: AgentForm; onChange: (updates: Partial<AgentForm>) => void; onGenerate?: () => void }
 
-function BasicsStep({ form, onChange }: StepProps) {
+function PromptGeneratorModal({
+  form,
+  open,
+  onClose,
+  onApply,
+}: {
+  form: AgentForm;
+  open: boolean;
+  onClose: () => void;
+  onApply: (prompt: GeneratedPrompt) => void;
+}) {
+  const [mode, setMode] = useState<"generate" | "improve" | null>(null);
+  const [result, setResult] = useState<GeneratedPrompt | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (open) {
+      setMode(null);
+      setResult(null);
+      setError("");
+    }
+  }, [open]);
+
+  if (!open) return null;
+
+  const generate = async (selectedMode: "generate" | "improve") => {
+    setMode(selectedMode);
+    setLoading(true);
+    setError("");
+    try {
+      const generated = await apiRequest("/prompt-generator", {
+        method: "POST",
+        body: JSON.stringify({ mode: selectedMode, configuration: form }),
+      });
+      setResult(generated);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Failed to generate prompt");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70" role="dialog" aria-modal="true" aria-labelledby="prompt-generator-title">
+      <div className="w-full max-w-2xl max-h-[90vh] overflow-y-auto bg-[#0d101a] border border-[rgba(99,102,241,0.3)] rounded-xl shadow-2xl">
+        <div className="flex items-center gap-3 px-5 py-4 border-b border-[rgba(99,102,241,0.14)]">
+          <Sparkles className="w-5 h-5 text-[#a78bfa]" />
+          <h2 id="prompt-generator-title" className="text-base font-semibold text-[#e2e4ef]">Prompt Generator</h2>
+          <button onClick={onClose} className="ml-auto text-[#636680] hover:text-[#e2e4ef]" aria-label="Close prompt generator"><X className="w-4 h-4" /></button>
+        </div>
+        <div className="p-5 space-y-4">
+          {!result && !loading && (
+            <>
+              <p className="text-sm text-[#b4b8cc]">Use your Agent Basics fields to create or refine the three prompt sections.</p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <button onClick={() => void generate("generate")} className="p-4 text-left bg-[#111520] border border-[rgba(99,102,241,0.18)] rounded-lg hover:border-[#6366f1] transition-colors">
+                  <span className="block text-sm font-medium text-[#e2e4ef]">Generate from scratch</span>
+                  <span className="block mt-1 text-xs text-[#636680]">Create all three sections from your agent context.</span>
+                </button>
+                <button onClick={() => void generate("improve")} className="p-4 text-left bg-[#111520] border border-[rgba(99,102,241,0.18)] rounded-lg hover:border-[#6366f1] transition-colors">
+                  <span className="block text-sm font-medium text-[#e2e4ef]">Improve existing prompt</span>
+                  <span className="block mt-1 text-xs text-[#636680]">Clarify and strengthen your current sections.</span>
+                </button>
+              </div>
+            </>
+          )}
+          {loading && <p className="py-8 text-center text-sm text-[#b4b8cc]">Generating with your selected LLM...</p>}
+          {error && <p className="text-sm text-[#f87171]">{error}</p>}
+          {result && !loading && (
+            <>
+              <p className="text-xs text-[#636680]">Review the generated content before applying it to your form.</p>
+              {(["purpose", "systemInstructions", "goals"] as const).map(field => (
+                <div key={field}>
+                  <Label>{field === "purpose" ? "Purpose & Context" : field === "systemInstructions" ? "System Instructions" : "Goals & Success Criteria"}</Label>
+                  <Textarea rows={field === "systemInstructions" ? 6 : 3} value={result[field]} onChange={event => setResult({ ...result, [field]: event.target.value })} />
+                </div>
+              ))}
+              {result.suggestions.length > 0 && <div className="p-3 bg-[rgba(245,158,11,0.08)] border border-[rgba(245,158,11,0.2)] rounded-md"><p className="text-xs font-medium text-[#fbbf24]">Suggestions</p><ul className="mt-1 space-y-1 text-xs text-[#b4b8cc]">{result.suggestions.map(suggestion => <li key={suggestion}>- {suggestion}</li>)}</ul></div>}
+              <div className="flex justify-end gap-2 pt-2">
+                <button onClick={() => { setResult(null); void generate(mode || "generate"); }} className="px-3 py-2 text-sm text-[#b4b8cc] hover:text-white">Regenerate</button>
+                <button onClick={() => onApply(result)} className="px-4 py-2 bg-[#6366f1] text-white text-sm rounded-md hover:bg-[#4f46e5]">Use / Apply</button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BasicsStep({ form, onChange, onGenerate }: StepProps) {
   return (
     <div className="space-y-6">
       <SectionHeader icon={Wand2} title="Agent Basics" subtitle="Define who your voice agent is, what it does, and how it should behave." />
@@ -634,7 +732,12 @@ function BasicsStep({ form, onChange }: StepProps) {
         <Input value={form.description} onChange={e => onChange({ description: e.target.value })} placeholder="One-line description of what this agent does" />
       </div>
       <div>
-        <Label>Purpose & Context</Label>
+        <div className="flex items-center justify-between mb-1.5">
+          <Label className="mb-0">Purpose & Context</Label>
+          <button onClick={onGenerate} className="flex items-center gap-1.5 px-3 py-1.5 bg-[rgba(99,102,241,0.16)] border border-[rgba(99,102,241,0.3)] rounded-md text-xs text-[#c4b5fd] hover:bg-[rgba(99,102,241,0.25)] transition-colors">
+            <Sparkles className="w-3.5 h-3.5" /> Generate / Improve Prompt
+          </button>
+        </div>
         <Textarea
           rows={3} value={form.purpose}
           onChange={e => onChange({ purpose: e.target.value })}
@@ -1517,6 +1620,7 @@ function AgentWizard({ initialForm, onBack, onSave, isEditing, editingId }: Wiza
   const [form, setForm] = useState<AgentForm>(initialForm);
   const [step, setStep] = useState(0);
   const [saved, setSaved] = useState(false);
+  const [promptGeneratorOpen, setPromptGeneratorOpen] = useState(false);
 
   const onChange = useCallback((updates: Partial<AgentForm>) => {
     setForm(prev => ({ ...prev, ...updates }));
@@ -1533,8 +1637,13 @@ function AgentWizard({ initialForm, onBack, onSave, isEditing, editingId }: Wiza
     onBack();
   };
 
+  const applyGeneratedPrompt = (generated: GeneratedPrompt) => {
+    onChange({ purpose: generated.purpose, systemInstructions: generated.systemInstructions, goals: generated.goals });
+    setPromptGeneratorOpen(false);
+  };
+
   const steps = [
-    <BasicsStep key={0} form={form} onChange={onChange} />,
+    <BasicsStep key={0} form={form} onChange={onChange} onGenerate={() => setPromptGeneratorOpen(true)} />,
     <AIModelsStep key={1} form={form} onChange={onChange} />,
     <VoiceStep key={2} form={form} onChange={onChange} />,
     <KnowledgeStep key={3} form={form} onChange={onChange} />,
@@ -1560,6 +1669,7 @@ function AgentWizard({ initialForm, onBack, onSave, isEditing, editingId }: Wiza
 
   return (
     <div className="flex flex-col h-full min-h-screen" style={{ fontFamily: "DM Sans, sans-serif" }}>
+      <PromptGeneratorModal form={form} open={promptGeneratorOpen} onClose={() => setPromptGeneratorOpen(false)} onApply={applyGeneratedPrompt} />
       {/* Top bar */}
       <div className="flex items-center gap-4 px-6 py-3.5 border-b border-[rgba(99,102,241,0.14)] bg-[#09090f] sticky top-0 z-30">
         <button onClick={onBack} className="flex items-center gap-1.5 text-sm text-[#636680] hover:text-[#e2e4ef] transition-colors">
