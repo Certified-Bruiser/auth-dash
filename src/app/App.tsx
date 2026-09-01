@@ -105,6 +105,10 @@ interface GeneratedPrompt {
   purpose: string;
   systemInstructions: string;
   goals: string;
+  allowedTopics?: string[];
+  restrictedTopics?: string[];
+  escalationRules?: string;
+  humanHandoffConditions?: string;
   suggestions: string[];
 }
 
@@ -629,6 +633,10 @@ function PromptGeneratorModal({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
+  const updateResult = <K extends keyof GeneratedPrompt>(field: K, value: GeneratedPrompt[K]) => {
+    setResult(prev => (prev ? { ...prev, [field]: value } : prev));
+  };
+
   useEffect(() => {
     if (open) {
       setMode(null);
@@ -688,9 +696,37 @@ function PromptGeneratorModal({
               {(["purpose", "systemInstructions", "goals"] as const).map(field => (
                 <div key={field}>
                   <Label>{field === "purpose" ? "Purpose & Context" : field === "systemInstructions" ? "System Instructions" : "Goals & Success Criteria"}</Label>
-                  <Textarea rows={field === "systemInstructions" ? 6 : 3} value={result[field]} onChange={event => setResult({ ...result, [field]: event.target.value })} />
+                  <Textarea rows={field === "systemInstructions" ? 6 : 3} value={result[field]} onChange={event => updateResult(field, event.target.value)} />
                 </div>
               ))}
+              <div className="space-y-4 pt-2">
+                <div>
+                  <Label>Allowed Topics</Label>
+                  <TagInput
+                    tags={result.allowedTopics || []}
+                    onAdd={t => updateResult("allowedTopics", [...(result.allowedTopics || []), t])}
+                    onRemove={t => updateResult("allowedTopics", (result.allowedTopics || []).filter(x => x !== t))}
+                    placeholder="e.g. appointment availability, rescheduling"
+                  />
+                </div>
+                <div>
+                  <Label>Restricted Topics</Label>
+                  <TagInput
+                    tags={result.restrictedTopics || []}
+                    onAdd={t => updateResult("restrictedTopics", [...(result.restrictedTopics || []), t])}
+                    onRemove={t => updateResult("restrictedTopics", (result.restrictedTopics || []).filter(x => x !== t))}
+                    placeholder="e.g. legal advice, unrelated financial matters"
+                  />
+                </div>
+                <div>
+                  <Label>Escalation Rules</Label>
+                  <Textarea rows={3} value={result.escalationRules || ""} onChange={event => updateResult("escalationRules", event.target.value)} placeholder="e.g. Escalate when the user requests a human or if a policy issue is outside the agent's scope." />
+                </div>
+                <div>
+                  <Label>Human Handoff Conditions</Label>
+                  <Textarea rows={2} value={result.humanHandoffConditions || ""} onChange={event => updateResult("humanHandoffConditions", event.target.value)} placeholder="e.g. Transfer the user to a live agent when they say 'speak to a person' or if the issue is sensitive or escalated." />
+                </div>
+              </div>
               {result.suggestions.length > 0 && <div className="p-3 bg-[rgba(245,158,11,0.08)] border border-[rgba(245,158,11,0.2)] rounded-md"><p className="text-xs font-medium text-[#fbbf24]">Suggestions</p><ul className="mt-1 space-y-1 text-xs text-[#b4b8cc]">{result.suggestions.map(suggestion => <li key={suggestion}>- {suggestion}</li>)}</ul></div>}
               <div className="flex justify-end gap-2 pt-2">
                 <button onClick={() => { setResult(null); void generate(mode || "generate"); }} className="px-3 py-2 text-sm text-[#b4b8cc] hover:text-white">Regenerate</button>
@@ -1278,10 +1314,20 @@ function MemoryStep({ form, onChange }: StepProps) {
   );
 }
 
-function SecurityStep({ form, onChange }: StepProps) {
+function SecurityStep({ form, onChange, onGenerate }: StepProps) {
   return (
     <div className="space-y-6">
       <SectionHeader icon={Shield} title="Security & Guardrails" subtitle="Define what your agent can and cannot discuss, and how to handle edge cases." />
+      {onGenerate && (
+        <div className="flex justify-end">
+          <button
+            onClick={onGenerate}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-[rgba(99,102,241,0.16)] border border-[rgba(99,102,241,0.3)] rounded-md text-xs text-[#c4b5fd] hover:bg-[rgba(99,102,241,0.25)] transition-colors"
+          >
+            <Sparkles className="w-3.5 h-3.5" /> Generate with AI
+          </button>
+        </div>
+      )}
       <div>
         <Label>Allowed Topics</Label>
         <TagInput
@@ -1638,7 +1684,15 @@ function AgentWizard({ initialForm, onBack, onSave, isEditing, editingId }: Wiza
   };
 
   const applyGeneratedPrompt = (generated: GeneratedPrompt) => {
-    onChange({ purpose: generated.purpose, systemInstructions: generated.systemInstructions, goals: generated.goals });
+    onChange({
+      purpose: form.purpose || generated.purpose,
+      systemInstructions: form.systemInstructions || generated.systemInstructions,
+      goals: form.goals || generated.goals,
+      allowedTopics: form.allowedTopics.length > 0 ? form.allowedTopics : (generated.allowedTopics || []),
+      restrictedTopics: form.restrictedTopics.length > 0 ? form.restrictedTopics : (generated.restrictedTopics || []),
+      escalationRules: form.escalationRules || generated.escalationRules || "",
+      humanHandoffConditions: form.humanHandoffConditions || generated.humanHandoffConditions || "",
+    });
     setPromptGeneratorOpen(false);
   };
 
@@ -1650,7 +1704,7 @@ function AgentWizard({ initialForm, onBack, onSave, isEditing, editingId }: Wiza
     <ConversationStep key={4} form={form} onChange={onChange} />,
     <ToolsStep key={5} form={form} onChange={onChange} />,
     <MemoryStep key={6} form={form} onChange={onChange} />,
-    <SecurityStep key={7} form={form} onChange={onChange} />,
+    <SecurityStep key={7} form={form} onChange={onChange} onGenerate={() => setPromptGeneratorOpen(true)} />,
     <TestStep key={8} form={form} agentId={editingId} />,
     <PublishStep key={9} form={form} onPublish={handlePublish} onSaveDraft={() => handleSave("draft")} />,
   ];
