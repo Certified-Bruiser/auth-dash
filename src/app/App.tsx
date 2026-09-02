@@ -419,6 +419,26 @@ function cn(...classes: (string | boolean | undefined)[]) {
 
 const API_BASE_URL = "http://localhost:8000";
 const WS_URL = "ws://localhost:8000/ws";
+const AOS_USER_ID_KEY = "aos_user_id";
+
+function generateAosUserId() {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const bytes = new Uint32Array(7);
+  if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * alphabet.length);
+    }
+  }
+
+  let value = "AOS-";
+  for (let index = 0; index < bytes.length; index += 1) {
+    value += alphabet[bytes[index] % alphabet.length];
+  }
+
+  return value;
+}
 
 async function apiRequest(path: string, options: RequestInit = {}) {
   const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -1850,11 +1870,24 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
   const [callDuration, setCallDuration] = useState(0);
   const [messages, setMessages] = useState<TestMessage[]>([]);
   const [processing, setProcessing] = useState(false);
+  const [aosUserId, setAosUserId] = useState("");
+  const [aosUserIdError, setAosUserIdError] = useState("");
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const nextAudioTimeRef = useRef(0);
+
+  useEffect(() => {
+    try {
+      const storedUserId = window.localStorage.getItem(AOS_USER_ID_KEY);
+      if (storedUserId) {
+        setAosUserId(storedUserId);
+      }
+    } catch {
+      // Local storage access can be unavailable in some browser contexts.
+    }
+  }, []);
 
   useEffect(() => {
     if (callActive) {
@@ -1875,7 +1908,33 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
 
   const formatDuration = (s: number) => `${Math.floor(s / 60).toString().padStart(2, "0")}:${(s % 60).toString().padStart(2, "0")}`;
 
+  const normalizedUserId = aosUserId.trim().toUpperCase();
+
+  const handleGenerateAosUserId = () => {
+    const generated = generateAosUserId();
+    setAosUserId(generated);
+    setAosUserIdError("");
+    try {
+      window.localStorage.setItem(AOS_USER_ID_KEY, generated);
+    } catch {
+      // Ignore storage failures and keep the in-memory value.
+    }
+  };
+
   const startCall = () => {
+    const trimmedUserId = normalizedUserId;
+    if (!trimmedUserId || trimmedUserId === "AOS-") {
+      setAosUserIdError("AOS User ID is required");
+      return;
+    }
+
+    setAosUserId(trimmedUserId);
+    try {
+      window.localStorage.setItem(AOS_USER_ID_KEY, trimmedUserId);
+    } catch {
+      // Ignore storage failures and keep the in-memory value.
+    }
+    setAosUserIdError("");
     setCallActive(true);
     setMessages([{ id: "0", role: "agent", content: "Hello! Thanks for calling. How can I assist you today?", timestamp: new Date().toLocaleTimeString() }]);
     const audioContext = new AudioContext({ sampleRate: 16000 });
@@ -1930,7 +1989,7 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
     socket.onopen = () => {
       apiRequest("/start", {
         method: "POST",
-        body: JSON.stringify({ agent_id: agent.id }),
+        body: JSON.stringify({ agent_id: agent.id, user_id: normalizedUserId }),
       }).catch(error => {
         console.error("Audio session start failed:", error);
         setCallActive(false);
@@ -1990,14 +2049,47 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
         {/* Transcript */}
         <div className="h-64 overflow-y-auto p-4 space-y-3" style={{ scrollbarWidth: "none" }}>
           {!callActive ? (
-            <div className="h-full flex flex-col items-center justify-center gap-3 text-center">
-              <div className="w-16 h-16 rounded-full bg-[rgba(99,102,241,0.1)] border-2 border-[rgba(99,102,241,0.2)] flex items-center justify-center">
-                <Phone className="w-6 h-6 text-[#6366f1]" />
+            <div className="h-full flex flex-col justify-center gap-4 p-4 text-left">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-[rgba(99,102,241,0.15)] flex items-center justify-center">
+                  <Bot className="w-5 h-5 text-[#6366f1]" />
+                </div>
+                <div>
+                  <p className="text-sm text-[#e2e4ef] font-medium">Talk to {agent.name}</p>
+                  <p className="text-xs text-[#636680] mt-0.5">Voice: {agent.voice} · {agent.language.toUpperCase()}</p>
+                </div>
               </div>
-              <div>
-                <p className="text-sm text-[#e2e4ef] font-medium">Start a live conversation</p>
-                <p className="text-xs text-[#636680] mt-0.5">Voice: {agent.voice} · {agent.language.toUpperCase()}</p>
+
+              <div className="space-y-2">
+                <label className="block text-xs uppercase tracking-[0.2em] text-[#636680]">AOS User ID</label>
+                <Input
+                  value={aosUserId}
+                  onChange={event => {
+                    setAosUserId(event.target.value);
+                    if (aosUserIdError) setAosUserIdError("");
+                  }}
+                  placeholder="AOS-7F29K4"
+                  className="bg-[#111520]"
+                />
+                {aosUserIdError && <p className="text-xs text-[#ef4444]">{aosUserIdError}</p>}
               </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleGenerateAosUserId}
+                  className="flex-1 px-3 py-2 bg-[#171d2e] border border-[rgba(99,102,241,0.2)] text-[#b4b8cc] text-sm rounded-lg hover:border-[rgba(99,102,241,0.4)] transition-colors"
+                >
+                  Generate ID
+                </button>
+                <button
+                  onClick={startCall}
+                  className="flex-1 px-3 py-2 bg-[#6366f1] text-white text-sm rounded-lg hover:bg-[#4f46e5] transition-colors font-medium"
+                >
+                  Continue
+                </button>
+              </div>
+
+              <p className="text-[11px] text-[#636680]">Don&apos;t have an AOS User ID?</p>
             </div>
           ) : (
             <>
