@@ -393,7 +393,7 @@ const WIZARD_STEPS = [
 
 const defaultForm: AgentForm = {
   name: "", description: "", agentType: "customer-support", purpose: "",
-  systemInstructions: "You are a helpful, knowledgeable AI voice assistant. Be concise, friendly, and stay on topic. If you don't know something, say so honestly.",
+  systemInstructions: "",
   personality: "friendly", tone: "warm", conversationStyle: "conversational", goals: "",
   sttProvider: "sarvam", sttModel: "saaras:v3",
   llmProvider: "perplexity", llmModel: "sonar", llmTemperature: 0.7, llmMaxTokens: 512,
@@ -1032,9 +1032,7 @@ function VoiceStep({ form, onChange }: StepProps) {
           <Label>Language</Label>
           <Select value={form.language} onChange={e => onChange({ language: e.target.value })}>
             {[
-              ["en", "English"], ["es", "Spanish"], ["fr", "French"], ["de", "German"],
-              ["it", "Italian"], ["pt", "Portuguese"], ["ja", "Japanese"], ["zh", "Chinese"],
-              ["ko", "Korean"], ["ar", "Arabic"], ["hi", "Hindi"],
+              ["en", "English"],["hi", "Hindi"],
             ].map(([v, l]) => <option key={v} value={v}>{l}</option>)}
           </Select>
         </div>
@@ -1951,28 +1949,76 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
     socketRef.current = socket;
     socket.binaryType = "arraybuffer";
     socket.onmessage = event => {
+      console.log("[BROWSER AUDIO] MESSAGE RECEIVED", {
+        type: typeof event.data,
+        isArrayBuffer: event.data instanceof ArrayBuffer,
+        byteLength: event.data instanceof ArrayBuffer ? event.data.byteLength : undefined,
+      });
       if (event.data instanceof ArrayBuffer) {
-        const context = audioContextRef.current;
-        if (!context) return;
-        console.log(`[BROWSER AUDIO] websocket binary received bytes=${event.data.byteLength}`);
-        console.log(`[BROWSER AUDIO] decoding PCM bytes=${event.data.byteLength}`);
-        console.log(`[AUDIO] browser audio chunk received bytes=${event.data.byteLength}`);
-        const samples = new Int16Array(event.data);
-        const audioBuffer = context.createBuffer(1, samples.length, 16000);
-        const channel = audioBuffer.getChannelData(0);
-        for (let index = 0; index < samples.length; index += 1) {
-          channel[index] = samples[index] / 32768;
+        try {
+          const context = audioContextRef.current;
+          if (!context) return;
+          console.log("[BROWSER AUDIO] AUDIOCONTEXT", {
+            state: context.state,
+            currentTime: context.currentTime,
+            sampleRate: context.sampleRate,
+          });
+          console.log(`[BROWSER AUDIO] websocket binary received bytes=${event.data.byteLength}`);
+          console.log(`[BROWSER AUDIO] decoding PCM bytes=${event.data.byteLength}`);
+          console.log(`[AUDIO] browser audio chunk received bytes=${event.data.byteLength}`);
+          const samples = new Int16Array(event.data);
+          let minimumSample = 0;
+          let maximumSample = 0;
+          if (samples.length > 0) {
+            minimumSample = samples[0];
+            maximumSample = samples[0];
+            for (let index = 1; index < samples.length; index += 1) {
+              minimumSample = Math.min(minimumSample, samples[index]);
+              maximumSample = Math.max(maximumSample, samples[index]);
+            }
+          }
+          console.log("[BROWSER AUDIO] PCM INPUT", {
+            byteLength: event.data.byteLength,
+            sampleCount: samples.length,
+            firstSample: samples[0],
+            minimumSample,
+            maximumSample,
+            allZeroSamples: minimumSample === 0 && maximumSample === 0,
+          });
+          const audioBuffer = context.createBuffer(1, samples.length, 16000);
+          console.log("[BROWSER AUDIO] AUDIOBUFFER CREATED", {
+            channels: audioBuffer.numberOfChannels,
+            length: audioBuffer.length,
+            sampleRate: audioBuffer.sampleRate,
+            duration: audioBuffer.duration,
+          });
+          const channel = audioBuffer.getChannelData(0);
+          for (let index = 0; index < samples.length; index += 1) {
+            channel[index] = samples[index] / 32768;
+          }
+          const source = context.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(context.destination);
+          source.onended = () => {
+            console.log("[BROWSER AUDIO] SOURCE ENDED");
+          };
+          const startTime = Math.max(context.currentTime, nextAudioTimeRef.current);
+          console.log("[BROWSER AUDIO] PLAYBACK SCHEDULE", {
+            contextCurrentTime: context.currentTime,
+            nextAudioTime: nextAudioTimeRef.current,
+            startTime,
+            scheduledDelay: startTime - context.currentTime,
+            bufferDuration: audioBuffer.duration,
+            contextState: context.state,
+          });
+          console.log("[BROWSER AUDIO] SOURCE STARTING");
+          source.start(startTime);
+          console.log("[BROWSER AUDIO] SOURCE START CALLED");
+          nextAudioTimeRef.current = startTime + audioBuffer.duration;
+          console.log("[AUDIO] browser playback started");
+        } catch (error) {
+          console.error("[BROWSER AUDIO] PLAYBACK ERROR", error);
         }
-        const source = context.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(context.destination);
-        console.log(`[BROWSER AUDIO] AudioBuffer created samples=${samples.length} duration=${audioBuffer.duration} sampleRate=${audioBuffer.sampleRate}`);
-        const startTime = Math.max(context.currentTime, nextAudioTimeRef.current);
-        console.log(`[BROWSER AUDIO] source.start startTime=${startTime} currentTime=${context.currentTime} duration=${audioBuffer.duration} state=${context.state}`);
-        source.start(startTime);
-        console.log("[BROWSER AUDIO] source.start COMPLETE");
-        nextAudioTimeRef.current = startTime + audioBuffer.duration;
-        console.log("[AUDIO] browser playback started");
         return;
       }
       const message = JSON.parse(event.data);
@@ -2021,6 +2067,50 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
     if (!callActive || processing) return;
     setIsListening(true);
   };
+
+  const buildTranscriptText = useCallback(() => {
+    const transcriptMessages = messages.filter(msg => msg.content && msg.content.trim().length > 0);
+
+    if (transcriptMessages.length === 0) {
+      return null;
+    }
+
+    const headingParts = ["AgentOS Conversation Transcript"];
+
+    if (agent.name) {
+      headingParts.push(`Agent: ${agent.name}`);
+    }
+
+    const header = `${headingParts.join("\n")}\n\n==================================================\n\n`;
+
+    const body = transcriptMessages
+      .map(msg => {
+        const label = msg.role === "user" ? "User" : "Agent";
+        return `${label}:\n${msg.content.trim()}\n`;
+      })
+      .join("\n");
+
+    return `${header}${body}\n`;
+  }, [agent.name, messages]);
+
+  const handleDownloadTranscript = useCallback(() => {
+    const transcriptText = buildTranscriptText();
+
+    if (!transcriptText) {
+      window.alert("No conversation transcript available to download.");
+      return;
+    }
+
+    const blob = new Blob([transcriptText], { type: "text/plain;charset=utf-8" });
+    const href = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = href;
+    link.download = "conversation-transcript.txt";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(href);
+  }, [buildTranscriptText]);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[rgba(0,0,0,0.8)] backdrop-blur-sm">
@@ -2134,10 +2224,17 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
               <Phone className="w-4 h-4" /> Start Conversation
             </button>
           ) : (
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <button onClick={endCall}
                 className="w-12 h-12 rounded-full bg-[#ef4444] text-white flex items-center justify-center hover:bg-[#dc2626] transition-colors">
                 <StopCircle className="w-5 h-5" />
+              </button>
+              <button
+                onClick={handleDownloadTranscript}
+                className="flex items-center justify-center gap-2 px-3 py-2.5 bg-[#171d2e] border border-[rgba(99,102,241,0.2)] text-[#b4b8cc] text-[11px] font-medium rounded-xl hover:border-[rgba(99,102,241,0.4)] transition-colors"
+              >
+                <Download className="w-3.5 h-3.5" />
+                Download Transcript
               </button>
               <button
                 onClick={handleMic}
