@@ -1875,6 +1875,56 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
   const socketRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const nextAudioTimeRef = useRef(0);
+  const audioSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const playbackGenerationRef = useRef(0);
+  const ttsCompleteGenerationRef = useRef<number | null>(null);
+  const playbackCompleteSentRef = useRef(false);
+  const acceptingAudioRef = useRef(true);
+
+  const sendPlaybackCompleteIfReady = (generation: number) => {
+    if (
+      generation !== playbackGenerationRef.current ||
+      generation !== ttsCompleteGenerationRef.current ||
+      audioSourcesRef.current.size !== 0 ||
+      !acceptingAudioRef.current ||
+      playbackCompleteSentRef.current
+    ) {
+      return;
+    }
+
+    playbackCompleteSentRef.current = true;
+    socketRef.current?.send(JSON.stringify({
+      event: "playback_complete",
+      data: { generation },
+    }));
+  };
+
+  const stopScheduledAudio = () => {
+    console.log("[BARGE-IN DEBUG] stopping scheduled audio", {
+      activeSourcesBefore: audioSourcesRef.current.size,
+      playbackGeneration: playbackGenerationRef.current,
+    });
+    for (const source of audioSourcesRef.current) {
+      try {
+        console.log("[AUDIO DEBUG] AudioBufferSourceNode.stop() called", {
+          activeSourcesBefore: audioSourcesRef.current.size,
+          playbackGeneration: playbackGenerationRef.current,
+        });
+        source.stop();
+      } catch {
+        // Ignore sources that have already ended.
+      }
+    }
+    audioSourcesRef.current.clear();
+    if (audioContextRef.current) {
+      nextAudioTimeRef.current = audioContextRef.current.currentTime;
+    }
+    console.log("[BARGE-IN DEBUG] interruption cleanup complete", {
+      sourcesRemaining: audioSourcesRef.current.size,
+      playbackGeneration: playbackGenerationRef.current,
+      nextAudioTime: nextAudioTimeRef.current,
+    });
+  };
 
   useEffect(() => {
     try {
@@ -1899,6 +1949,7 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
   useEffect(() => () => {
+    stopScheduledAudio();
     socketRef.current?.close();
     void audioContextRef.current?.close();
     void apiRequest("/stop", { method: "POST" }).catch(() => undefined);
@@ -1956,6 +2007,14 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
       });
       if (event.data instanceof ArrayBuffer) {
         try {
+          console.log("[AUDIO DEBUG] binary audio chunk received", {
+            byteLength: event.data.byteLength,
+            activeSources: audioSourcesRef.current.size,
+            playbackGeneration: playbackGenerationRef.current,
+            acceptingAudio: acceptingAudioRef.current,
+          });
+          const playbackGeneration = playbackGenerationRef.current;
+          if (!acceptingAudioRef.current) return;
           const context = audioContextRef.current;
           if (!context) return;
           console.log("[BROWSER AUDIO] AUDIOCONTEXT", {
@@ -1996,13 +2055,42 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
           for (let index = 0; index < samples.length; index += 1) {
             channel[index] = samples[index] / 32768;
           }
+          if (playbackGeneration !== playbackGenerationRef.current || !acceptingAudioRef.current) {
+            console.log("[GENERATION DEBUG] stale/late audio chunk rejected", {
+              chunkGeneration: playbackGeneration,
+              currentGeneration: playbackGenerationRef.current,
+              acceptingAudio: acceptingAudioRef.current,
+            });
+            return;
+          }
           const source = context.createBufferSource();
+          console.log("[AUDIO DEBUG] AudioBufferSourceNode created", {
+            playbackGeneration,
+            activeSources: audioSourcesRef.current.size,
+          });
           source.buffer = audioBuffer;
           source.connect(context.destination);
           source.onended = () => {
+            audioSourcesRef.current.delete(source);
+            console.log("[AUDIO DEBUG] AudioBufferSourceNode naturally finished", {
+              activeSourcesRemaining: audioSourcesRef.current.size,
+              playbackGeneration: playbackGenerationRef.current,
+            });
             console.log("[BROWSER AUDIO] SOURCE ENDED");
+            sendPlaybackCompleteIfReady(playbackGeneration);
           };
+          audioSourcesRef.current.add(source);
+          console.log("[AUDIO DEBUG] source added to tracked collection", {
+            activeSources: audioSourcesRef.current.size,
+            playbackGeneration,
+          });
           const startTime = Math.max(context.currentTime, nextAudioTimeRef.current);
+          console.log("[AUDIO DEBUG] binary audio chunk about to be scheduled", {
+            playbackGeneration,
+            currentGeneration: playbackGenerationRef.current,
+            activeSources: audioSourcesRef.current.size,
+            startTime,
+          });
           console.log("[BROWSER AUDIO] PLAYBACK SCHEDULE", {
             contextCurrentTime: context.currentTime,
             nextAudioTime: nextAudioTimeRef.current,
@@ -2022,14 +2110,40 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
         return;
       }
       const message = JSON.parse(event.data);
+      if (message.event === "interruption") {
+        console.log("[BARGE-IN DEBUG] backend interruption event received", {
+          activeSourcesBefore: audioSourcesRef.current.size,
+          generationBefore: playbackGenerationRef.current,
+          acceptingAudioBefore: acceptingAudioRef.current,
+        });
+        playbackGenerationRef.current = message.data.generation;
+        console.log("[GENERATION DEBUG] playback generation invalidated", {
+          generationBefore: playbackGenerationRef.current - 1,
+          generationAfter: playbackGenerationRef.current,
+        });
+        acceptingAudioRef.current = false;
+        ttsCompleteGenerationRef.current = null;
+        playbackCompleteSentRef.current = false;
+        stopScheduledAudio();
+        return;
+      }
       if (message.event === "transcript") {
         setIsListening(false);
         setProcessing(true);
         setMessages(prev => [...prev, { id: `${Date.now()}-user`, role: "user", content: message.data.text, timestamp: new Date().toLocaleTimeString() }]);
       }
       if (message.event === "assistant") {
+        playbackGenerationRef.current = message.data.generation;
+        ttsCompleteGenerationRef.current = null;
+        playbackCompleteSentRef.current = false;
+        audioSourcesRef.current.clear();
+        acceptingAudioRef.current = true;
         setProcessing(false);
         setMessages(prev => [...prev, { id: `${Date.now()}-agent`, role: "agent", content: message.data.text, timestamp: new Date().toLocaleTimeString() }]);
+      }
+      if (message.event === "tts_complete") {
+        ttsCompleteGenerationRef.current = message.data.generation;
+        sendPlaybackCompleteIfReady(message.data.generation);
       }
     };
     socket.onopen = () => {
@@ -2056,6 +2170,7 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
     setIsListening(false);
     setProcessing(false);
     setCallDuration(0);
+    stopScheduledAudio();
     socketRef.current?.close();
     socketRef.current = null;
     void audioContextRef.current?.close();
