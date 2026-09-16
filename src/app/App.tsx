@@ -648,7 +648,10 @@ function PromptGeneratorModal({
   onClose: () => void;
   onApply: (prompt: GeneratedPrompt) => void;
 }) {
+  const [promptStep, setPromptStep] = useState<"provider" | "mode">("provider");
   const [mode, setMode] = useState<"generate" | "improve" | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState("");
+  const [selectedModel, setSelectedModel] = useState("");
   const [result, setResult] = useState<GeneratedPrompt | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -659,7 +662,10 @@ function PromptGeneratorModal({
 
   useEffect(() => {
     if (open) {
+      setPromptStep("provider");
       setMode(null);
+      setSelectedProvider("");
+      setSelectedModel("");
       setResult(null);
       setError("");
     }
@@ -674,7 +680,14 @@ function PromptGeneratorModal({
     try {
       const generated = await apiRequest("/prompt-generator", {
         method: "POST",
-        body: JSON.stringify({ mode: selectedMode, configuration: form }),
+        body: JSON.stringify({
+          mode: selectedMode,
+          configuration: {
+            ...form,
+            llmProvider: selectedProvider,
+            llmModel: selectedModel,
+          },
+        }),
       });
       setResult(generated);
     } catch (requestError) {
@@ -693,7 +706,39 @@ function PromptGeneratorModal({
           <button onClick={onClose} className="ml-auto text-[#636680] hover:text-[#e2e4ef]" aria-label="Close prompt generator"><X className="w-4 h-4" /></button>
         </div>
         <div className="p-5 space-y-4">
-          {!result && !loading && (
+          {!result && !loading && promptStep === "provider" && (
+            <>
+              <p className="text-sm text-[#b4b8cc]">Choose an LLM for prompt generation.</p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {Object.entries(LLM_PROVIDERS).map(([id, provider]) => (
+                  <ProviderCard
+                    key={id}
+                    id={id}
+                    name={provider.name}
+                    badge={id.toUpperCase().slice(0, 3)}
+                    selected={selectedProvider === id}
+                    onClick={() => {
+                      setSelectedProvider(id);
+                      setSelectedModel(provider.models[0]?.id || "");
+                    }}
+                  />
+                ))}
+              </div>
+              {selectedProvider && !selectedModel && (
+                <p className="text-xs text-[#fbbf24]">The selected LLM has no available model.</p>
+              )}
+              <div className="flex justify-end pt-2">
+                <button
+                  onClick={() => setPromptStep("mode")}
+                  disabled={!selectedProvider || !selectedModel}
+                  className="px-4 py-2 bg-[#6366f1] text-white text-sm rounded-md hover:bg-[#4f46e5] disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  Next
+                </button>
+              </div>
+            </>
+          )}
+          {!result && !loading && promptStep === "mode" && (
             <>
               <p className="text-sm text-[#b4b8cc]">Use your Agent Basics fields to create or refine the three prompt sections.</p>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
