@@ -142,49 +142,7 @@ let STT_PROVIDERS: Record<string, { name: string; badge: string; models: { id: s
   },
 };
 
-let LLM_PROVIDERS: Record<string, { name: string; badge: string; models: { id: string; name: string; context: string }[] }> = {
-  openai: {
-    name: "OpenAI", badge: "OAI",
-    models: [
-      { id: "gpt-4o", name: "GPT-4o", context: "128K" },
-      { id: "gpt-4o-mini", name: "GPT-4o Mini", context: "128K" },
-      { id: "gpt-4-turbo", name: "GPT-4 Turbo", context: "128K" },
-      { id: "gpt-3.5-turbo", name: "GPT-3.5 Turbo", context: "16K" },
-    ],
-  },
-  anthropic: {
-    name: "Anthropic", badge: "ANT",
-    models: [
-      { id: "claude-opus-5", name: "Claude Opus 5", context: "200K" },
-      { id: "claude-sonnet-5", name: "Claude Sonnet 5", context: "200K" },
-      { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", context: "200K" },
-    ],
-  },
-  google: {
-    name: "Google Gemini", badge: "GEM",
-    models: [
-      { id: "gemini-2.0-flash", name: "Gemini 2.0 Flash", context: "1M" },
-      { id: "gemini-1.5-pro", name: "Gemini 1.5 Pro", context: "1M" },
-      { id: "gemini-1.5-flash", name: "Gemini 1.5 Flash", context: "1M" },
-    ],
-  },
-  mistral: {
-    name: "Mistral AI", badge: "MST",
-    models: [
-      { id: "mistral-large-latest", name: "Mistral Large", context: "128K" },
-      { id: "mistral-medium-latest", name: "Mistral Medium", context: "32K" },
-      { id: "mistral-small-latest", name: "Mistral Small", context: "32K" },
-    ],
-  },
-  groq: {
-    name: "Groq", badge: "GRQ",
-    models: [
-      { id: "llama-3.3-70b-versatile", name: "Llama 3.3 70B", context: "128K" },
-      { id: "mixtral-8x7b-32768", name: "Mixtral 8x7B", context: "32K" },
-      { id: "gemma2-9b-it", name: "Gemma 2 9B", context: "8K" },
-    ],
-  },
-};
+let LLM_PROVIDERS: Record<string, { name: string; badge: string; models: { id: string; name: string; context: string }[] }> = {};
 
 interface VoiceOption { id: string; name: string; gender: string; accent: string; style: string }
 let TTS_PROVIDERS: Record<string, {
@@ -2869,6 +2827,14 @@ if (!session) {
       ttsProvider: editingAgent.ttsProvider, ttsModel: editingAgent.ttsModel,
       voice: editingAgent.voice, language: editingAgent.language,
       personality: editingAgent.personality, tone: editingAgent.tone,
+      purpose: (editingAgent as Partial<AgentForm>).purpose ?? defaultForm.purpose,
+      systemInstructions: (editingAgent as Partial<AgentForm>).systemInstructions ?? defaultForm.systemInstructions,
+      goals: (editingAgent as Partial<AgentForm>).goals ?? defaultForm.goals,
+      allowedTopics: (editingAgent as Partial<AgentForm>).allowedTopics ?? defaultForm.allowedTopics,
+      restrictedTopics: (editingAgent as Partial<AgentForm>).restrictedTopics ?? defaultForm.restrictedTopics,
+      escalationRules: (editingAgent as Partial<AgentForm>).escalationRules ?? defaultForm.escalationRules,
+      humanHandoffConditions: (editingAgent as Partial<AgentForm>).humanHandoffConditions ?? defaultForm.humanHandoffConditions,
+      conversationStyle: (editingAgent as Partial<AgentForm>).conversationStyle ?? defaultForm.conversationStyle,
     };
   };
 
