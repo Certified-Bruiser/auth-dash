@@ -30,11 +30,18 @@ export default function LoginForm({ onSwitch }: Props) {
   }
 }
 
+  const handleOAuthSignIn = async (provider: 'google' | 'github') => {
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider,
+      options: {
+        redirectTo: window.location.origin,
+      },
+    })
 
-
-
-
-
+    if (error) {
+      alert(error.message)
+    }
+  }
 
   return (
     <div style={{ width: '100%', maxWidth: '400px' }}>
@@ -51,8 +58,8 @@ export default function LoginForm({ onSwitch }: Props) {
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '28px' }}>
-        <SSOButton icon={<GoogleIcon />} label="Google" />
-        <SSOButton icon={<GithubIcon />} label="GitHub" />
+        <SSOButton icon={<GoogleIcon />} label="Google" onClick={() => handleOAuthSignIn('google')} />
+        <SSOButton icon={<GithubIcon />} label="GitHub" onClick={() => handleOAuthSignIn('github')} />
       </div>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '28px' }}>
@@ -147,11 +154,12 @@ export default function LoginForm({ onSwitch }: Props) {
   )
 }
 
-function SSOButton({ icon, label }: { icon: React.ReactNode; label: string }) {
+function SSOButton({ icon, label, onClick }: { icon: React.ReactNode; label: string; onClick: () => void }) {
   const [hov, setHov] = useState(false)
   return (
     <button
       type="button"
+      onClick={onClick}
       onMouseEnter={() => setHov(true)}
       onMouseLeave={() => setHov(false)}
       style={{

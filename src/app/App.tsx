@@ -1063,6 +1063,7 @@ function KnowledgeStep({ form, onChange }: StepProps) {
   const [urlInput, setUrlInput] = useState("");
   const [faqQ, setFaqQ] = useState("");
   const [faqA, setFaqA] = useState("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const addSource = (type: KnowledgeSource["type"], name: string, value: string) => {
     const src: KnowledgeSource = { id: Date.now().toString(), type, name, value, status: "processing" };
@@ -1078,19 +1079,38 @@ function KnowledgeStep({ form, onChange }: StepProps) {
 
   const removeSource = (id: string) => onChange({ knowledgeSources: form.knowledgeSources.filter(s => s.id !== id) });
 
+  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    const fileName = file.name.toLowerCase();
+    if (!fileName.endsWith(".txt") && !fileName.endsWith(".md")) return;
+
+    addSource("document", file.name, await file.text());
+  };
+
   return (
     <div className="space-y-6">
       <SectionHeader icon={BookOpen} title="Knowledge Base" subtitle="Connect documents, websites, and FAQs to give your agent contextual knowledge." />
 
       {/* File upload */}
-      <div className="border-2 border-dashed border-[rgba(99,102,241,0.25)] rounded-xl p-8 text-center hover:border-[rgba(99,102,241,0.5)] transition-colors cursor-pointer group">
+      <div
+        onClick={() => fileInputRef.current?.click()}
+        className="border-2 border-dashed border-[rgba(99,102,241,0.25)] rounded-xl p-8 text-center hover:border-[rgba(99,102,241,0.5)] transition-colors cursor-pointer group"
+      >
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".txt,.md"
+          onChange={handleFileChange}
+          className="hidden"
+        />
         <div className="w-12 h-12 rounded-xl bg-[rgba(99,102,241,0.1)] flex items-center justify-center mx-auto mb-3 group-hover:bg-[rgba(99,102,241,0.2)] transition-colors">
           <Upload className="w-5 h-5 text-[#6366f1]" />
         </div>
         <p className="text-sm text-[#e2e4ef] font-medium mb-1">Drop files here or click to upload</p>
-        <p className="text-xs text-[#636680]">PDF, DOCX, TXT, CSV, JSON — up to 50MB each</p>
-        <button onClick={() => addSource("document", "product-manual.pdf", "uploaded")}
-          className="mt-3 text-xs text-[#6366f1] hover:text-[#a78bfa]">Add sample document</button>
+        <p className="text-xs text-[#636680]">TXT or Markdown files</p>
       </div>
 
       {/* URL */}
@@ -2835,6 +2855,7 @@ if (!session) {
       escalationRules: (editingAgent as Partial<AgentForm>).escalationRules ?? defaultForm.escalationRules,
       humanHandoffConditions: (editingAgent as Partial<AgentForm>).humanHandoffConditions ?? defaultForm.humanHandoffConditions,
       conversationStyle: (editingAgent as Partial<AgentForm>).conversationStyle ?? defaultForm.conversationStyle,
+      knowledgeSources: (editingAgent as Partial<AgentForm>).knowledgeSources ?? defaultForm.knowledgeSources,
     };
   };
 
