@@ -398,12 +398,19 @@ function generateAosUserId() {
   return value;
 }
 
-async function apiRequest(path: string, options: RequestInit = {}) {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    ...options,
+async function apiRequest(path: string, options: RequestInit & { userId?: string } = {}) {
+  const { userId, ...requestOptions } = options;
+  const url = new URL(`${API_BASE_URL}${path}`);
+
+  if (userId) {
+    url.searchParams.set("user_id", userId);
+  }
+
+  const response = await fetch(url.toString(), {
+    ...requestOptions,
     headers: {
       "Content-Type": "application/json",
-      ...(options.headers || {}),
+      ...(requestOptions.headers || {}),
     },
   });
   const data = await response.json().catch(() => null);
@@ -2731,7 +2738,9 @@ export default function App() {
 
     let mounted = true;
 
-    apiRequest("/agents?page=1&page_size=100")
+    apiRequest("/agents?page=1&page_size=100", {
+      userId: session.user?.id,
+    })
       .then(data => {
         if (mounted) setAgents((data.items || []).map(mapAgent));
       })
@@ -2800,6 +2809,7 @@ if (!session) {
         {
           method: editingAgent ? "PATCH" : "POST",
           body: JSON.stringify(form),
+          userId: session?.user?.id,
         },
       );
       const savedAgent = mapAgent(data);
@@ -2818,6 +2828,7 @@ if (!session) {
       const data = await apiRequest("/agents", {
         method: "POST",
         body: JSON.stringify({ ...agent, name: `${agent.name} (Copy)`, status: "draft" }),
+        userId: session?.user?.id,
       });
       setAgents(prev => [mapAgent(data), ...prev]);
     } catch (error) {
@@ -2828,7 +2839,10 @@ if (!session) {
 
   const handleDeleteAgent = async (id: string) => {
     try {
-      await apiRequest(`/agents/${id}`, { method: "DELETE" });
+      await apiRequest(`/agents/${id}`, {
+        method: "DELETE",
+        userId: session?.user?.id,
+      });
       setAgents(prev => prev.filter(agent => agent.id !== id));
     } catch (error) {
       console.error("Failed to delete agent:", error);
