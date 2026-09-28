@@ -375,8 +375,8 @@ function cn(...classes: (string | boolean | undefined)[]) {
   return classes.filter(Boolean).join(" ");
 }
 
-const API_BASE_URL = "http://localhost:8000";
-const WS_URL = "ws://localhost:8000/ws";
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+const WS_URL = `${API_BASE_URL.replace(/^http:/, "ws:").replace(/^https:/, "wss:").replace(/\/$/, "")}/ws`;
 const AOS_USER_ID_KEY = "aos_user_id";
 
 function generateAosUserId() {
@@ -1910,6 +1910,27 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
   const ttsCompleteGenerationRef = useRef<number | null>(null);
   const playbackCompleteSentRef = useRef(false);
   const acceptingAudioRef = useRef(true);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const micProcessorRef = useRef<ScriptProcessorNode | null>(null);
+
+  const stopMicrophoneCapture = () => {
+    if (micProcessorRef.current) {
+      micProcessorRef.current.onaudioprocess = null;
+      micProcessorRef.current.disconnect();
+      micProcessorRef.current = null;
+    }
+    if (micSourceRef.current) {
+      micSourceRef.current.disconnect();
+      micSourceRef.current = null;
+    }
+    if (micStreamRef.current) {
+      for (const track of micStreamRef.current.getTracks()) {
+        track.stop();
+      }
+      micStreamRef.current = null;
+    }
+  };
 
   const sendPlaybackCompleteIfReady = (generation: number) => {
     if (
@@ -1977,13 +1998,6 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
   }, [callActive]);
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
-
-  useEffect(() => () => {
-    stopScheduledAudio();
-    socketRef.current?.close();
-    void audioContextRef.current?.close();
-    void apiRequest("/stop", { method: "POST" }).catch(() => undefined);
-  }, []);
 
   const formatDuration = (s: number) => `${Math.floor(s / 60).toString().padStart(2, "0")}:${(s % 60).toString().padStart(2, "0")}`;
 
@@ -2186,7 +2200,28 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
         setMessages(prev => [...prev, { id: `${Date.now()}-error`, role: "agent", content: error instanceof Error ? error.message : "Audio session start failed", timestamp: new Date().toLocaleTimeString() }]);
       });
     };
+    socket.onclose = () => {
+      console.warn("[BROWSER WS] socket closed", {
+        readyState: socket.readyState,
+        callActive,
+        processing,
+        isListening,
+      });
+      stopMicrophoneCapture();
+      setIsListening(false);
+      setProcessing(false);
+      if (callActive) {
+        setCallActive(false);
+      }
+    };
     socket.onerror = () => {
+      console.warn("[BROWSER WS] socket error", {
+        readyState: socket.readyState,
+        callActive,
+        processing,
+        isListening,
+      });
+      stopMicrophoneCapture();
       setCallActive(false);
       setProcessing(false);
       setIsListening(false);
@@ -2200,6 +2235,7 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
     setIsListening(false);
     setProcessing(false);
     setCallDuration(0);
+    stopMicrophoneCapture();
     stopScheduledAudio();
     socketRef.current?.close();
     socketRef.current = null;
@@ -2208,9 +2244,77 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
     void apiRequest("/stop", { method: "POST" }).catch(error => console.error("Audio session stop failed:", error));
   };
 
-  const handleMic = () => {
+  const handleMic = async () => {
     if (!callActive || processing) return;
-    setIsListening(true);
+    if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
+      console.warn("[BROWSER MIC] socket unavailable", {
+        readyState: socketRef.current ? socketRef.current.readyState : "missing",
+        callActive,
+        processing,
+        isListening,
+      });
+      return;
+    }
+    const context = audioContextRef.current;
+    if (!context) {
+      console.error("[BROWSER AUDIO] microphone capture skipped because AudioContext is not ready");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          sampleRate: 16000,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      });
+
+      stopMicrophoneCapture();
+      micStreamRef.current = stream;
+      const source = context.createMediaStreamSource(stream);
+      const processor = context.createScriptProcessor(256, 1, 1);
+
+      processor.onaudioprocess = event => {
+        const socket = socketRef.current;
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          console.warn("[BROWSER MIC] socket unavailable", {
+            readyState: socket ? socket.readyState : "missing",
+            callActive,
+            processing,
+            isListening,
+          });
+          return;
+        }
+
+        const input = event.inputBuffer.getChannelData(0);
+        const pcm = new ArrayBuffer(input.length * 2);
+        const view = new DataView(pcm);
+
+        for (let index = 0; index < input.length; index += 1) {
+          const sample = Math.max(-1, Math.min(1, input[index]));
+          const pcmValue = sample < 0 ? sample * 32768 : sample * 32767;
+          view.setInt16(index * 2, pcmValue, true);
+        }
+
+        socket.send(pcm);
+      };
+
+      source.connect(processor);
+      const silence = context.createGain();
+      silence.gain.value = 0;
+      processor.connect(silence);
+      silence.connect(context.destination);
+
+      micSourceRef.current = source;
+      micProcessorRef.current = processor;
+      setIsListening(true);
+    } catch (error) {
+      console.error("[BROWSER AUDIO] microphone capture failed", error);
+      setIsListening(false);
+    }
   };
 
   const buildTranscriptText = useCallback(() => {
@@ -2275,7 +2379,13 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
                 {formatDuration(callDuration)}
               </span>
             )}
-            <button onClick={onClose} className="text-[#636680] hover:text-[#e2e4ef] transition-colors">
+            <button
+              onClick={() => {
+                endCall();
+                onClose();
+              }}
+              className="text-[#636680] hover:text-[#e2e4ef] transition-colors"
+            >
               <X className="w-4 h-4" />
             </button>
           </div>
@@ -2765,7 +2875,7 @@ if (authLoading) {
 }
 
 if (!session) {
-  window.location.href = "http://localhost:5173";
+  window.location.href = window.location.origin;
   return null;
 }
 
@@ -2777,9 +2887,9 @@ if (!session) {
     const handleLogout = async () => {
   console.log("LOGOUT BUTTON CLICKED");
 
-  const { data, error } = await supabase.auth.signOut();
+  const { error } = await supabase.auth.signOut();
 
-  console.log("SIGN OUT RESULT:", { data, error });
+  console.log("SIGN OUT RESULT:", { error });
 
   const { data: sessionData } = await supabase.auth.getSession();
 
