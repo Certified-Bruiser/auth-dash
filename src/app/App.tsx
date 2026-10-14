@@ -317,12 +317,9 @@ function applyProviderCatalog(catalog: {
 }
 
 applyProviderCatalog({
-  stt: [{ id: "sarvam", name: "Sarvam Streaming", models: ["saaras:v3"] }],
-  llm: [{ id: "perplexity", name: "Perplexity Sonar", models: ["sonar"] }],
-  tts: [
-    { id: "piper", name: "Piper", models: [], voices: [] },
-    { id: "sarvam", name: "Sarvam Streaming", models: ["bulbul:v3"], voices: ["rahul"] },
-  ],
+  stt: [],
+  llm: [],
+  tts: [],
 });
 
 const AVAILABLE_TOOLS = [
@@ -398,8 +395,8 @@ function generateAosUserId() {
   return value;
 }
 
-async function apiRequest(path: string, options: RequestInit & { userId?: string } = {}) {
-  const { userId, ...requestOptions } = options;
+async function apiRequest(path: string, options: RequestInit & { userId?: string; accessToken?: string } = {}) {
+  const { userId, accessToken, ...requestOptions } = options;
   const url = new URL(`${API_BASE_URL}${path}`);
 
   if (userId) {
@@ -410,6 +407,7 @@ async function apiRequest(path: string, options: RequestInit & { userId?: string
     ...requestOptions,
     headers: {
       "Content-Type": "application/json",
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
       ...(requestOptions.headers || {}),
     },
   });
@@ -420,6 +418,124 @@ async function apiRequest(path: string, options: RequestInit & { userId?: string
   }
 
   return data;
+}
+
+function IntegrateAgentModal({
+  agent,
+  accessToken,
+  onClose,
+}: {
+  agent: Agent;
+  accessToken: string;
+  onClose: () => void;
+}) {
+  const [integration, setIntegration] = useState<{ id: string; websocket_url: string } | null>(null);
+  const [credential, setCredential] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [error, setError] = useState("");
+  const [copied, setCopied] = useState(false);
+
+  const createIntegration = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const data = await apiRequest(`/api/v1/agents/${agent.id}/integrations`, {
+        method: "POST",
+        accessToken,
+      });
+      setIntegration(data);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Integration creation failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const generateCredential = async () => {
+    if (!integration) return;
+    setGenerating(true);
+    setError("");
+    setCredential("");
+    try {
+      const data = await apiRequest(
+        `/api/v1/agents/${agent.id}/integrations/${integration.id}/credentials`,
+        { method: "POST", accessToken },
+      );
+      setCredential(data.credential);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Credential generation failed");
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const copyCredential = async () => {
+    await navigator.clipboard.writeText(credential);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1800);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70" role="dialog" aria-modal="true" aria-labelledby="integrate-agent-title">
+      <div className="w-full max-w-lg bg-[#0d1018] border border-[rgba(99,102,241,0.2)] rounded-xl shadow-2xl">
+        <div className="flex items-center gap-3 px-5 py-4 border-b border-[rgba(99,102,241,0.12)]">
+          <Radio className="w-4 h-4 text-[#22c55e]" />
+          <div>
+            <h2 id="integrate-agent-title" className="text-base font-semibold text-[#e2e4ef]">Integrate Agent</h2>
+            <p className="text-xs text-[#636680] mt-0.5">{agent.name}</p>
+          </div>
+          <button onClick={onClose} className="ml-auto text-[#636680] hover:text-[#e2e4ef]" aria-label="Close integration dialog">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        <div className="p-5 space-y-4">
+          {loading && <p className="text-sm text-[#b4b8cc]">Creating WebSocket integration...</p>}
+          {error && <p role="alert" className="text-sm text-[#ef4444]">{error}</p>}
+          {!integration && !loading && (
+            <button
+              onClick={() => void createIntegration()}
+              className="flex items-center gap-2 rounded-md bg-[#6366f1] px-3 py-2 text-sm font-medium text-white hover:bg-[#4f46e5]"
+            >
+              <Radio className="w-4 h-4" /> Create WebSocket integration
+            </button>
+          )}
+          {integration && (
+            <>
+              <div>
+                <p className="text-xs text-[#636680] mb-1">WebSocket URL</p>
+                <code className="block break-all rounded-md bg-[#07090f] px-3 py-2 text-xs text-[#b4b8cc]">{integration.websocket_url}</code>
+              </div>
+              <div>
+                <p className="text-xs text-[#636680] mb-1">Integration ID</p>
+                <code className="block break-all rounded-md bg-[#07090f] px-3 py-2 text-xs text-[#b4b8cc]">{integration.id}</code>
+              </div>
+              <button
+                onClick={() => void generateCredential()}
+                disabled={generating}
+                className="flex items-center gap-2 rounded-md bg-[#6366f1] px-3 py-2 text-sm font-medium text-white hover:bg-[#4f46e5] disabled:opacity-50"
+              >
+                <Key className="w-4 h-4" />
+                {generating ? "Generating..." : credential ? "Regenerate credential" : "Generate credential"}
+              </button>
+              {credential && (
+                <div>
+                  <p className="text-xs text-[#636680] mb-1">Credential</p>
+                  <div className="flex gap-2">
+                    <code className="min-w-0 flex-1 break-all rounded-md bg-[#07090f] px-3 py-2 text-xs text-[#b4b8cc]">{credential}</code>
+                    <button onClick={() => void copyCredential()} className="flex shrink-0 items-center gap-1 rounded-md border border-[rgba(99,102,241,0.2)] px-3 py-2 text-xs text-[#b4b8cc] hover:text-white">
+                      {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                      {copied ? "Copied" : "Copy"}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function mapAgent(data: any): Agent {
@@ -1733,13 +1849,13 @@ function AgentWizard({ initialForm, onBack, onSave, isEditing, editingId }: Wiza
 
   const applyGeneratedPrompt = (generated: GeneratedPrompt) => {
     onChange({
-      purpose: form.purpose || generated.purpose,
-      systemInstructions: form.systemInstructions || generated.systemInstructions,
-      goals: form.goals || generated.goals,
-      allowedTopics: form.allowedTopics.length > 0 ? form.allowedTopics : (generated.allowedTopics || []),
-      restrictedTopics: form.restrictedTopics.length > 0 ? form.restrictedTopics : (generated.restrictedTopics || []),
-      escalationRules: form.escalationRules || generated.escalationRules || "",
-      humanHandoffConditions: form.humanHandoffConditions || generated.humanHandoffConditions || "",
+      purpose: generated.purpose,
+      systemInstructions: generated.systemInstructions,
+      goals: generated.goals,
+      allowedTopics: generated.allowedTopics || [],
+      restrictedTopics: generated.restrictedTopics || [],
+      escalationRules: generated.escalationRules || "",
+      humanHandoffConditions: generated.humanHandoffConditions || "",
     });
     setPromptGeneratorOpen(false);
   };
@@ -1913,6 +2029,31 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
   const micStreamRef = useRef<MediaStream | null>(null);
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const micProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const backendReadyRef = useRef(false);
+  const micCallbackCountRef = useRef(0);
+  const voiceDiag = (event: string, details: Record<string, unknown> = {}) => {
+    console.info(`[${new Date().toISOString()}] [VOICE DIAG] ${event}`, details);
+  };
+
+  const resampleFloat32To16k = (input: Float32Array, inputRate: number): Float32Array => {
+    if (!Number.isFinite(inputRate) || inputRate <= 0 || inputRate === 16000) {
+      return input;
+    }
+
+    const outputLength = Math.max(1, Math.ceil(input.length * (16000 / inputRate)));
+    const output = new Float32Array(outputLength);
+
+    for (let index = 0; index < outputLength; index += 1) {
+      const sourceIndex = (index * input.length) / outputLength;
+      const before = Math.floor(sourceIndex);
+      const after = Math.min(input.length - 1, before + 1);
+      const fraction = sourceIndex - before;
+      const sample = input[before] * (1 - fraction) + input[after] * fraction;
+      output[index] = sample;
+    }
+
+    return output;
+  };
 
   const stopMicrophoneCapture = () => {
     if (micProcessorRef.current) {
@@ -1926,10 +2067,13 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
     }
     if (micStreamRef.current) {
       for (const track of micStreamRef.current.getTracks()) {
+        track.onended = null;
+        track.onmute = null;
         track.stop();
       }
       micStreamRef.current = null;
     }
+    setIsListening(false);
   };
 
   const sendPlaybackCompleteIfReady = (generation: number) => {
@@ -2017,10 +2161,12 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
   const startCall = () => {
     const trimmedUserId = normalizedUserId;
     if (!trimmedUserId || trimmedUserId === "AOS-") {
+      voiceDiag("call start guard: missing AOS user ID", { callActive, processing, isListening });
       setAosUserIdError("AOS User ID is required");
       return;
     }
 
+    backendReadyRef.current = false;
     setAosUserId(trimmedUserId);
     try {
       window.localStorage.setItem(AOS_USER_ID_KEY, trimmedUserId);
@@ -2032,11 +2178,22 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
     setMessages([{ id: "0", role: "agent", content: "Hello! Thanks for calling. How can I assist you today?", timestamp: new Date().toLocaleTimeString() }]);
     const audioContext = new AudioContext({ sampleRate: 16000 });
     audioContextRef.current = audioContext;
+    voiceDiag("AudioContext created", { state: audioContext.state, sampleRate: audioContext.sampleRate });
     console.log(`[BROWSER AUDIO] AudioContext created state=${audioContext.state} sampleRate=${audioContext.sampleRate}`);
+    voiceDiag("AudioContext resume started", { stateBeforeResume: audioContext.state });
     void audioContext.resume().then(() => {
+      voiceDiag("AudioContext resume succeeded", { stateAfterResume: audioContext.state });
       console.log(`[BROWSER AUDIO] AudioContext state after resume=${audioContext.state}`);
     }).catch(error => {
+      voiceDiag("AudioContext resume failed", { state: audioContext.state, errorName: error instanceof Error ? error.name : "unknown" });
       console.error("[BROWSER AUDIO] AudioContext resume FAILED", error);
+      stopMicrophoneCapture();
+      setCallActive(false);
+      setProcessing(false);
+      setIsListening(false);
+      void audioContext.close();
+      audioContextRef.current = null;
+      setMessages(prev => [...prev, { id: `${Date.now()}-error`, role: "agent", content: "Audio capture could not start. Please try again.", timestamp: new Date().toLocaleTimeString() }]);
     });
     nextAudioTimeRef.current = audioContext.currentTime;
 
@@ -2191,16 +2348,33 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
       }
     };
     socket.onopen = () => {
+      voiceDiag("frontend websocket open; /start requested", { readyState: socket.readyState });
       apiRequest("/start", {
         method: "POST",
         body: JSON.stringify({ agent_id: agent.id, user_id: normalizedUserId }),
+      }).then(() => {
+        backendReadyRef.current = true;
+        voiceDiag("/start succeeded; backend marked ready", { readyState: socket.readyState, backendReady: backendReadyRef.current });
       }).catch(error => {
+        backendReadyRef.current = false;
+        voiceDiag("/start failed", { readyState: socket.readyState, backendReady: backendReadyRef.current, errorName: error instanceof Error ? error.name : "unknown" });
         console.error("Audio session start failed:", error);
         setCallActive(false);
         setMessages(prev => [...prev, { id: `${Date.now()}-error`, role: "agent", content: error instanceof Error ? error.message : "Audio session start failed", timestamp: new Date().toLocaleTimeString() }]);
       });
     };
-    socket.onclose = () => {
+    socket.onclose = event => {
+      backendReadyRef.current = false;
+      voiceDiag("frontend websocket onclose", {
+        closeCode: event.code,
+        reason: event.reason,
+        wasClean: event.wasClean,
+        readyState: socket.readyState,
+        backendReady: backendReadyRef.current,
+        callActive,
+        processing,
+        isListening,
+      });
       console.warn("[BROWSER WS] socket closed", {
         readyState: socket.readyState,
         callActive,
@@ -2210,11 +2384,18 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
       stopMicrophoneCapture();
       setIsListening(false);
       setProcessing(false);
-      if (callActive) {
-        setCallActive(false);
-      }
+      setCallActive(false);
     };
-    socket.onerror = () => {
+    socket.onerror = event => {
+      backendReadyRef.current = false;
+      voiceDiag("frontend websocket onerror", {
+        eventType: event.type,
+        readyState: socket.readyState,
+        backendReady: backendReadyRef.current,
+        callActive,
+        processing,
+        isListening,
+      });
       console.warn("[BROWSER WS] socket error", {
         readyState: socket.readyState,
         callActive,
@@ -2231,12 +2412,24 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
   };
 
   const endCall = () => {
+    backendReadyRef.current = false;
     setCallActive(false);
     setIsListening(false);
     setProcessing(false);
     setCallDuration(0);
     stopMicrophoneCapture();
     stopScheduledAudio();
+    if (socketRef.current) {
+      voiceDiag("explicit frontend websocket close", {
+        readyState: socketRef.current.readyState,
+        closeCode: 1000,
+        reason: "",
+        backendReady: backendReadyRef.current,
+        callActive,
+        processing,
+        isListening,
+      });
+    }
     socketRef.current?.close();
     socketRef.current = null;
     void audioContextRef.current?.close();
@@ -2245,8 +2438,29 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
   };
 
   const handleMic = async () => {
-    if (!callActive || processing) return;
+    const socket = socketRef.current;
+    const micState = {
+      backendReady: backendReadyRef.current,
+      readyState: socket ? socket.readyState : "missing",
+      callActive,
+      processing,
+      isListening,
+    };
+    voiceDiag("microphone button clicked", micState);
+    if (!callActive) {
+      voiceDiag("microphone guard: callActive is false", micState);
+      return;
+    }
+    if (processing) {
+      voiceDiag("microphone guard: processing is true", micState);
+      return;
+    }
+    if (isListening) {
+      voiceDiag("microphone guard: isListening is true", micState);
+      return;
+    }
     if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
+      voiceDiag(`microphone guard: ${socketRef.current ? "WebSocket is not OPEN" : "WebSocket is missing"}`, micState);
       console.warn("[BROWSER MIC] socket unavailable", {
         readyState: socketRef.current ? socketRef.current.readyState : "missing",
         callActive,
@@ -2256,50 +2470,94 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
       return;
     }
     const context = audioContextRef.current;
-    if (!context) {
+    if (!context || context.state !== "running") {
+      voiceDiag(`microphone guard: ${context ? `AudioContext state is ${context.state}` : "AudioContext is missing"}`, micState);
       console.error("[BROWSER AUDIO] microphone capture skipped because AudioContext is not ready");
+      setIsListening(false);
       return;
     }
 
     try {
+      voiceDiag("getUserMedia started", micState);
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
           sampleRate: 16000,
-          echoCancellation: false,
+          echoCancellation: true,
           noiseSuppression: false,
           autoGainControl: false,
         },
       });
+      voiceDiag("getUserMedia succeeded", { audioTrackCount: stream.getAudioTracks().length });
+
+      const track = stream.getAudioTracks()[0];
+      if (track) {
+        track.onended = () => {
+          console.warn("[BROWSER MIC] input track ended; stopping capture");
+          stopMicrophoneCapture();
+        };
+        track.onmute = () => {
+          console.warn("[BROWSER MIC] input track muted; stopping capture");
+          stopMicrophoneCapture();
+        };
+      }
 
       stopMicrophoneCapture();
       micStreamRef.current = stream;
       const source = context.createMediaStreamSource(stream);
       const processor = context.createScriptProcessor(256, 1, 1);
+      micCallbackCountRef.current = 0;
 
       processor.onaudioprocess = event => {
+        const callbackNumber = ++micCallbackCountRef.current;
+        const shouldLogCallback = callbackNumber <= 5 || callbackNumber % 100 === 0;
         const socket = socketRef.current;
+        if (shouldLogCallback) {
+          voiceDiag("microphone audio callback", {
+            callbackNumber,
+            backendReady: backendReadyRef.current,
+            readyState: socket ? socket.readyState : "missing",
+            callActive,
+            processing,
+            isListening,
+          });
+        }
         if (!socket || socket.readyState !== WebSocket.OPEN) {
+          if (shouldLogCallback) voiceDiag("microphone frame skipped: WebSocket is not OPEN", { callbackNumber, readyState: socket ? socket.readyState : "missing" });
           console.warn("[BROWSER MIC] socket unavailable", {
             readyState: socket ? socket.readyState : "missing",
             callActive,
             processing,
             isListening,
           });
+          stopMicrophoneCapture();
+          return;
+        }
+        if (!backendReadyRef.current) {
+          if (shouldLogCallback) voiceDiag("microphone frame skipped: backendReadyRef is false", { callbackNumber, readyState: socket.readyState });
           return;
         }
 
-        const input = event.inputBuffer.getChannelData(0);
-        const pcm = new ArrayBuffer(input.length * 2);
-        const view = new DataView(pcm);
+        try {
+          const actualSampleRate = event.inputBuffer.sampleRate || context.sampleRate || 16000;
+          const input = event.inputBuffer.getChannelData(0);
+          const resampled = resampleFloat32To16k(input, actualSampleRate);
+          const pcm = new ArrayBuffer(resampled.length * 2);
+          const view = new DataView(pcm);
 
-        for (let index = 0; index < input.length; index += 1) {
-          const sample = Math.max(-1, Math.min(1, input[index]));
-          const pcmValue = sample < 0 ? sample * 32768 : sample * 32767;
-          view.setInt16(index * 2, pcmValue, true);
+          for (let index = 0; index < resampled.length; index += 1) {
+            const sample = Math.max(-1, Math.min(1, resampled[index]));
+            const pcmValue = sample < 0 ? sample * 32768 : sample * 32767;
+            view.setInt16(index * 2, pcmValue, true);
+          }
+
+          socket.send(pcm);
+          if (shouldLogCallback) voiceDiag("microphone frame sent", { callbackNumber, frameBytes: pcm.byteLength, readyState: socket.readyState });
+        } catch (error) {
+          if (shouldLogCallback) voiceDiag("microphone frame send failed", { callbackNumber, errorName: error instanceof Error ? error.name : "unknown" });
+          console.error("[BROWSER MIC] send failed", error);
+          stopMicrophoneCapture();
         }
-
-        socket.send(pcm);
       };
 
       source.connect(processor);
@@ -2312,7 +2570,9 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
       micProcessorRef.current = processor;
       setIsListening(true);
     } catch (error) {
+      voiceDiag("getUserMedia or microphone setup failed", { errorName: error instanceof Error ? error.name : "unknown" });
       console.error("[BROWSER AUDIO] microphone capture failed", error);
+      stopMicrophoneCapture();
       setIsListening(false);
     }
   };
@@ -2521,13 +2781,14 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
 interface DashboardProps {
   agents: Agent[];
   onCreateAgent: () => void;
+  onIntegrateAgent: (agent: Agent) => void;
   onEditAgent: (agent: Agent) => void;
   onUseAgent: (agent: Agent) => void;
   onDuplicateAgent: (agent: Agent) => void;
   onDeleteAgent: (id: string) => void;
 }
 
-function Dashboard({ agents, onCreateAgent, onEditAgent, onUseAgent, onDuplicateAgent, onDeleteAgent }: DashboardProps) {
+function Dashboard({ agents, onCreateAgent, onIntegrateAgent, onEditAgent, onUseAgent, onDuplicateAgent, onDeleteAgent }: DashboardProps) {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<"all" | AgentStatus>("all");
   const [sortBy, setSortBy] = useState<"name" | "lastUpdated" | "totalCalls">("lastUpdated");
@@ -2699,6 +2960,12 @@ function Dashboard({ agents, onCreateAgent, onEditAgent, onUseAgent, onDuplicate
                         </button>
                       )}
                       <button
+                        onClick={() => onIntegrateAgent(agent)}
+                        className="flex items-center gap-1 px-2.5 py-1.5 bg-[rgba(34,197,94,0.08)] border border-[rgba(34,197,94,0.2)] text-[#22c55e] text-xs rounded-lg hover:bg-[rgba(34,197,94,0.16)] transition-colors whitespace-nowrap"
+                      >
+                        <Radio className="w-3 h-3" /> Integrate Agent
+                      </button>
+                      <button
                         onClick={() => onEditAgent(agent)}
                         className="flex items-center gap-1 px-2.5 py-1.5 bg-[rgba(99,102,241,0.1)] border border-[rgba(99,102,241,0.2)] text-[#a78bfa] text-xs rounded-lg hover:bg-[rgba(99,102,241,0.2)] transition-colors"
                       >
@@ -2796,6 +3063,7 @@ export default function App() {
   const [, setProviderCatalogVersion] = useState(0);
   const [editingAgent, setEditingAgent] = useState<Agent | null>(null);
   const [useAgentTarget, setUseAgentTarget] = useState<Agent | null>(null);
+  const [integrationTarget, setIntegrationTarget] = useState<Agent | null>(null);
 
 
   useEffect(() => {
@@ -3040,6 +3308,7 @@ if (!session) {
         <Dashboard
           agents={agents}
           onCreateAgent={handleCreateAgent}
+          onIntegrateAgent={setIntegrationTarget}
           onEditAgent={handleEditAgent}
           onUseAgent={setUseAgentTarget}
           onDuplicateAgent={handleDuplicateAgent}
@@ -3060,6 +3329,13 @@ if (!session) {
 
       {useAgentTarget && (
         <UseAgentModal agent={useAgentTarget} onClose={() => setUseAgentTarget(null)} />
+      )}
+      {integrationTarget && (
+        <IntegrateAgentModal
+          agent={integrationTarget}
+          accessToken={session.access_token}
+          onClose={() => setIntegrationTarget(null)}
+        />
       )}
     </div>
   );
