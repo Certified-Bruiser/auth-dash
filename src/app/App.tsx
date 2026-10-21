@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { supabase } from '../lib/supabase'
+import VoiceOnboarding from "./VoiceOnboarding.tsx";
 import {
   Mic, Volume2, Brain, Database, MessageSquare, Wrench, Shield,
   Play, Upload, Search, Plus, Trash2, Copy, CheckCircle, Clock,
@@ -16,7 +17,7 @@ import {
 // ─── TYPES ────────────────────────────────────────────────────────────────────
 
 type AgentStatus = "draft" | "testing" | "published";
-type View = "dashboard" | "wizard" | "use-agent";
+type View = "dashboard" | "wizard" | "voice-onboarding" | "use-agent";
 
 interface Agent {
   id: string;
@@ -373,35 +374,11 @@ function cn(...classes: (string | boolean | undefined)[]) {
 }
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
-const WS_URL = `${API_BASE_URL.replace(/^http:/, "ws:").replace(/^https:/, "wss:").replace(/\/$/, "")}/ws`;
-const AOS_USER_ID_KEY = "aos_user_id";
+const WS_BASE_URL = API_BASE_URL.replace(/^http:/, "ws:").replace(/^https:/, "wss:").replace(/\/$/, "");
 
-function generateAosUserId() {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const bytes = new Uint32Array(7);
-  if (typeof crypto !== "undefined" && crypto.getRandomValues) {
-    crypto.getRandomValues(bytes);
-  } else {
-    for (let index = 0; index < bytes.length; index += 1) {
-      bytes[index] = Math.floor(Math.random() * alphabet.length);
-    }
-  }
-
-  let value = "AOS-";
-  for (let index = 0; index < bytes.length; index += 1) {
-    value += alphabet[bytes[index] % alphabet.length];
-  }
-
-  return value;
-}
-
-async function apiRequest(path: string, options: RequestInit & { userId?: string; accessToken?: string } = {}) {
-  const { userId, accessToken, ...requestOptions } = options;
+async function apiRequest(path: string, options: RequestInit & { accessToken?: string } = {}) {
+  const { accessToken, ...requestOptions } = options;
   const url = new URL(`${API_BASE_URL}${path}`);
-
-  if (userId) {
-    url.searchParams.set("user_id", userId);
-  }
 
   const response = await fetch(url.toString(), {
     ...requestOptions,
@@ -1549,7 +1526,7 @@ const MOCK_RESPONSES = [
   "Absolutely! I can help you with that. Just to confirm, you're asking about the Pro plan pricing?",
 ];
 
-function TestStep({ form, agentId }: { form: AgentForm; agentId?: string }) {
+function TestStep({ form, agentId, accessToken }: { form: AgentForm; agentId?: string; accessToken: string }) {
   const [messages, setMessages] = useState<TestMessage[]>([]);
   const [input, setInput] = useState("");
   const [isRecording, setIsRecording] = useState(false);
@@ -1582,6 +1559,7 @@ function TestStep({ form, agentId }: { form: AgentForm; agentId?: string }) {
     try {
       const data = await apiRequest("/chat", {
         method: "POST",
+        accessToken,
         body: JSON.stringify({ agent_id: agentId, message: text }),
       });
       setMessages(prev => [...prev, { id: (Date.now() + 1).toString(), role: "agent", content: data.response, timestamp: new Date().toLocaleTimeString() }]);
@@ -1820,13 +1798,14 @@ function PublishStep({ form, onPublish, onSaveDraft }: { form: AgentForm; onPubl
 
 interface WizardProps {
   initialForm: AgentForm;
+  accessToken: string;
   onBack: () => void;
   onSave: (form: AgentForm) => void;
   isEditing: boolean;
   editingId?: string;
 }
 
-function AgentWizard({ initialForm, onBack, onSave, isEditing, editingId }: WizardProps) {
+function AgentWizard({ initialForm, accessToken, onBack, onSave, isEditing, editingId }: WizardProps) {
   const [form, setForm] = useState<AgentForm>(initialForm);
   const [step, setStep] = useState(0);
   const [saved, setSaved] = useState(false);
@@ -1869,7 +1848,7 @@ function AgentWizard({ initialForm, onBack, onSave, isEditing, editingId }: Wiza
     <ToolsStep key={5} form={form} onChange={onChange} />,
     <MemoryStep key={6} form={form} onChange={onChange} />,
     <SecurityStep key={7} form={form} onChange={onChange} onGenerate={() => setPromptGeneratorOpen(true)} />,
-    <TestStep key={8} form={form} agentId={editingId} />,
+    <TestStep key={8} form={form} agentId={editingId} accessToken={accessToken} />,
     <PublishStep key={9} form={form} onPublish={handlePublish} onSaveDraft={() => handleSave("draft")} />,
   ];
 
@@ -2008,14 +1987,12 @@ function AgentWizard({ initialForm, onBack, onSave, isEditing, editingId }: Wiza
 
 // ─── USE AGENT MODAL ──────────────────────────────────────────────────────────
 
-function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }) {
+function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessToken: string; onClose: () => void }) {
   const [callActive, setCallActive] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [callDuration, setCallDuration] = useState(0);
   const [messages, setMessages] = useState<TestMessage[]>([]);
   const [processing, setProcessing] = useState(false);
-  const [aosUserId, setAosUserId] = useState("");
-  const [aosUserIdError, setAosUserIdError] = useState("");
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const socketRef = useRef<WebSocket | null>(null);
@@ -2122,17 +2099,6 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
   };
 
   useEffect(() => {
-    try {
-      const storedUserId = window.localStorage.getItem(AOS_USER_ID_KEY);
-      if (storedUserId) {
-        setAosUserId(storedUserId);
-      }
-    } catch {
-      // Local storage access can be unavailable in some browser contexts.
-    }
-  }, []);
-
-  useEffect(() => {
     if (callActive) {
       timerRef.current = setInterval(() => setCallDuration(d => d + 1), 1000);
     } else {
@@ -2145,35 +2111,8 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
 
   const formatDuration = (s: number) => `${Math.floor(s / 60).toString().padStart(2, "0")}:${(s % 60).toString().padStart(2, "0")}`;
 
-  const normalizedUserId = aosUserId.trim().toUpperCase();
-
-  const handleGenerateAosUserId = () => {
-    const generated = generateAosUserId();
-    setAosUserId(generated);
-    setAosUserIdError("");
-    try {
-      window.localStorage.setItem(AOS_USER_ID_KEY, generated);
-    } catch {
-      // Ignore storage failures and keep the in-memory value.
-    }
-  };
-
   const startCall = () => {
-    const trimmedUserId = normalizedUserId;
-    if (!trimmedUserId || trimmedUserId === "AOS-") {
-      voiceDiag("call start guard: missing AOS user ID", { callActive, processing, isListening });
-      setAosUserIdError("AOS User ID is required");
-      return;
-    }
-
     backendReadyRef.current = false;
-    setAosUserId(trimmedUserId);
-    try {
-      window.localStorage.setItem(AOS_USER_ID_KEY, trimmedUserId);
-    } catch {
-      // Ignore storage failures and keep the in-memory value.
-    }
-    setAosUserIdError("");
     setCallActive(true);
     setMessages([{ id: "0", role: "agent", content: "Hello! Thanks for calling. How can I assist you today?", timestamp: new Date().toLocaleTimeString() }]);
     const audioContext = new AudioContext({ sampleRate: 16000 });
@@ -2197,7 +2136,10 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
     });
     nextAudioTimeRef.current = audioContext.currentTime;
 
-    const socket = new WebSocket(WS_URL);
+    const socket = new WebSocket(
+      `${WS_BASE_URL}/api/v1/ws/preview/agents/${agent.id}`,
+      ["aos-owner-preview", accessToken],
+    );
     socketRef.current = socket;
     socket.binaryType = "arraybuffer";
     socket.onmessage = event => {
@@ -2208,14 +2150,26 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
       });
       if (event.data instanceof ArrayBuffer) {
         try {
+          if (event.data.byteLength < 4) return;
+          const frameGeneration = new DataView(event.data).getUint32(0, true);
+          if (
+            frameGeneration !== playbackGenerationRef.current ||
+            !acceptingAudioRef.current
+          ) {
+            console.log("[GENERATION DEBUG] stale/late audio chunk rejected", {
+              chunkGeneration: frameGeneration,
+              currentGeneration: playbackGenerationRef.current,
+              acceptingAudio: acceptingAudioRef.current,
+            });
+            return;
+          }
           console.log("[AUDIO DEBUG] binary audio chunk received", {
-            byteLength: event.data.byteLength,
+            byteLength: event.data.byteLength - 4,
             activeSources: audioSourcesRef.current.size,
             playbackGeneration: playbackGenerationRef.current,
             acceptingAudio: acceptingAudioRef.current,
           });
-          const playbackGeneration = playbackGenerationRef.current;
-          if (!acceptingAudioRef.current) return;
+          const playbackGeneration = frameGeneration;
           const context = audioContextRef.current;
           if (!context) return;
           console.log("[BROWSER AUDIO] AUDIOCONTEXT", {
@@ -2223,10 +2177,10 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
             currentTime: context.currentTime,
             sampleRate: context.sampleRate,
           });
-          console.log(`[BROWSER AUDIO] websocket binary received bytes=${event.data.byteLength}`);
-          console.log(`[BROWSER AUDIO] decoding PCM bytes=${event.data.byteLength}`);
-          console.log(`[AUDIO] browser audio chunk received bytes=${event.data.byteLength}`);
-          const samples = new Int16Array(event.data);
+          console.log(`[BROWSER AUDIO] websocket binary received bytes=${event.data.byteLength - 4}`);
+          console.log(`[BROWSER AUDIO] decoding PCM bytes=${event.data.byteLength - 4}`);
+          console.log(`[AUDIO] browser audio chunk received bytes=${event.data.byteLength - 4}`);
+          const samples = new Int16Array(event.data, 4);
           let minimumSample = 0;
           let maximumSample = 0;
           if (samples.length > 0) {
@@ -2301,7 +2255,14 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
             contextState: context.state,
           });
           console.log("[BROWSER AUDIO] SOURCE STARTING");
-          source.start(startTime);
+          try {
+            source.start(startTime);
+          } catch (error) {
+            source.onended = null;
+            audioSourcesRef.current.delete(source);
+            sendPlaybackCompleteIfReady(playbackGeneration);
+            throw error;
+          }
           console.log("[BROWSER AUDIO] SOURCE START CALLED");
           nextAudioTimeRef.current = startTime + audioBuffer.duration;
           console.log("[AUDIO] browser playback started");
@@ -2312,6 +2273,7 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
       }
       const message = JSON.parse(event.data);
       if (message.event === "interruption") {
+        if (message.data.generation <= playbackGenerationRef.current) return;
         console.log("[BARGE-IN DEBUG] backend interruption event received", {
           activeSourcesBefore: audioSourcesRef.current.size,
           generationBefore: playbackGenerationRef.current,
@@ -2334,6 +2296,7 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
         setMessages(prev => [...prev, { id: `${Date.now()}-user`, role: "user", content: message.data.text, timestamp: new Date().toLocaleTimeString() }]);
       }
       if (message.event === "assistant") {
+        if (message.data.generation < playbackGenerationRef.current) return;
         playbackGenerationRef.current = message.data.generation;
         ttsCompleteGenerationRef.current = null;
         playbackCompleteSentRef.current = false;
@@ -2346,22 +2309,13 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
         ttsCompleteGenerationRef.current = message.data.generation;
         sendPlaybackCompleteIfReady(message.data.generation);
       }
+      if (message.event === "ready") {
+        backendReadyRef.current = true;
+        voiceDiag("owner preview runtime ready", { readyState: socket.readyState });
+      }
     };
     socket.onopen = () => {
-      voiceDiag("frontend websocket open; /start requested", { readyState: socket.readyState });
-      apiRequest("/start", {
-        method: "POST",
-        body: JSON.stringify({ agent_id: agent.id, user_id: normalizedUserId }),
-      }).then(() => {
-        backendReadyRef.current = true;
-        voiceDiag("/start succeeded; backend marked ready", { readyState: socket.readyState, backendReady: backendReadyRef.current });
-      }).catch(error => {
-        backendReadyRef.current = false;
-        voiceDiag("/start failed", { readyState: socket.readyState, backendReady: backendReadyRef.current, errorName: error instanceof Error ? error.name : "unknown" });
-        console.error("Audio session start failed:", error);
-        setCallActive(false);
-        setMessages(prev => [...prev, { id: `${Date.now()}-error`, role: "agent", content: error instanceof Error ? error.message : "Audio session start failed", timestamp: new Date().toLocaleTimeString() }]);
-      });
+      voiceDiag("owner preview WebSocket connected", { readyState: socket.readyState });
     };
     socket.onclose = event => {
       backendReadyRef.current = false;
@@ -2434,7 +2388,6 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
     socketRef.current = null;
     void audioContextRef.current?.close();
     audioContextRef.current = null;
-    void apiRequest("/stop", { method: "POST" }).catch(error => console.error("Audio session stop failed:", error));
   };
 
   const handleMic = async () => {
@@ -2489,6 +2442,12 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
         },
       });
       voiceDiag("getUserMedia succeeded", { audioTrackCount: stream.getAudioTracks().length });
+      if (socketRef.current !== socket || audioContextRef.current !== context) {
+        for (const track of stream.getTracks()) {
+          track.stop();
+        }
+        return;
+      }
 
       const track = stream.getAudioTracks()[0];
       if (track) {
@@ -2654,47 +2613,9 @@ function UseAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }
         {/* Transcript */}
         <div className="h-64 overflow-y-auto p-4 space-y-3" style={{ scrollbarWidth: "none" }}>
           {!callActive ? (
-            <div className="h-full flex flex-col justify-center gap-4 p-4 text-left">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-[rgba(99,102,241,0.15)] flex items-center justify-center">
-                  <Bot className="w-5 h-5 text-[#6366f1]" />
-                </div>
-                <div>
-                  <p className="text-sm text-[#e2e4ef] font-medium">Talk to {agent.name}</p>
-                  <p className="text-xs text-[#636680] mt-0.5">Voice: {agent.voice} · {agent.language.toUpperCase()}</p>
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                <label className="block text-xs uppercase tracking-[0.2em] text-[#636680]">AOS User ID</label>
-                <Input
-                  value={aosUserId}
-                  onChange={event => {
-                    setAosUserId(event.target.value);
-                    if (aosUserIdError) setAosUserIdError("");
-                  }}
-                  placeholder="AOS-7F29K4"
-                  className="bg-[#111520]"
-                />
-                {aosUserIdError && <p className="text-xs text-[#ef4444]">{aosUserIdError}</p>}
-              </div>
-
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={handleGenerateAosUserId}
-                  className="flex-1 px-3 py-2 bg-[#171d2e] border border-[rgba(99,102,241,0.2)] text-[#b4b8cc] text-sm rounded-lg hover:border-[rgba(99,102,241,0.4)] transition-colors"
-                >
-                  Generate ID
-                </button>
-                <button
-                  onClick={startCall}
-                  className="flex-1 px-3 py-2 bg-[#6366f1] text-white text-sm rounded-lg hover:bg-[#4f46e5] transition-colors font-medium"
-                >
-                  Continue
-                </button>
-              </div>
-
-              <p className="text-[11px] text-[#636680]">Don&apos;t have an AOS User ID?</p>
+            <div className="h-full flex flex-col justify-center gap-3 p-4 text-left">
+              <p className="text-sm text-[#e2e4ef] font-medium">Talk to {agent.name}</p>
+              <p className="text-xs text-[#636680]">Voice: {agent.voice} · {agent.language.toUpperCase()}</p>
             </div>
           ) : (
             <>
@@ -3116,8 +3037,8 @@ export default function App() {
 
     let mounted = true;
 
-    apiRequest("/agents?page=1&page_size=100", {
-      userId: session.user?.id,
+    apiRequest("/api/v1/agents?page=1&page_size=100", {
+      accessToken: session.access_token,
     })
       .then(data => {
         if (mounted) setAgents((data.items || []).map(mapAgent));
@@ -3183,11 +3104,11 @@ if (!session) {
   const handleSaveAgent = async (form: AgentForm) => {
     try {
       const data = await apiRequest(
-        editingAgent ? `/agents/${editingAgent.id}` : "/agents",
+        editingAgent ? `/api/v1/agents/${editingAgent.id}` : "/api/v1/agents",
         {
           method: editingAgent ? "PATCH" : "POST",
           body: JSON.stringify(form),
-          userId: session?.user?.id,
+          accessToken: session?.access_token,
         },
       );
       const savedAgent = mapAgent(data);
@@ -3203,10 +3124,10 @@ if (!session) {
 
   const handleDuplicateAgent = async (agent: Agent) => {
     try {
-      const data = await apiRequest("/agents", {
+      const data = await apiRequest("/api/v1/agents", {
         method: "POST",
         body: JSON.stringify({ ...agent, name: `${agent.name} (Copy)`, status: "draft" }),
-        userId: session?.user?.id,
+        accessToken: session?.access_token,
       });
       setAgents(prev => [mapAgent(data), ...prev]);
     } catch (error) {
@@ -3217,9 +3138,9 @@ if (!session) {
 
   const handleDeleteAgent = async (id: string) => {
     try {
-      await apiRequest(`/agents/${id}`, {
+      await apiRequest(`/api/v1/agents/${id}`, {
         method: "DELETE",
-        userId: session?.user?.id,
+        accessToken: session?.access_token,
       });
       setAgents(prev => prev.filter(agent => agent.id !== id));
     } catch (error) {
@@ -3262,21 +3183,22 @@ if (!session) {
             </div>
             <span className="text-sm font-bold text-[#e2e4ef]" style={{ fontFamily: "Outfit, sans-serif" }}>VoxAgent</span>
           </div>
-          <nav className="flex items-center gap-1">
+          <nav className="flex min-w-0 items-center gap-1 overflow-x-auto">
             {[
-              { label: "Agents", active: true },
-              { label: "Templates", active: false },
-              { label: "Analytics", active: false },
-              { label: "Docs", active: false },
+              { label: "Agents", view: "dashboard" as const },
+              { label: "Templates", view: null },
+              { label: "Analytics", view: null },
+              { label: "Docs", view: null },
+              { label: "Voice Mode", view: "voice-onboarding" as const },
             ].map(item => (
               <button key={item.label}
                 className={cn(
-                  "px-3 py-1.5 text-sm rounded-lg transition-colors",
-                  item.active && view === "dashboard"
+                  "shrink-0 px-3 py-1.5 text-sm rounded-lg transition-colors",
+                  (item.view === view || (item.label === "Agents" && view === "wizard"))
                     ? "text-[#e2e4ef] bg-[rgba(99,102,241,0.12)]"
                     : "text-[#636680] hover:text-[#b4b8cc] hover:bg-[#111520]"
                 )}
-                onClick={() => { if (item.label === "Agents") setView("dashboard"); }}
+                onClick={() => { if (item.view) setView(item.view); }}
               >
                 {item.label}
               </button>
@@ -3316,10 +3238,13 @@ if (!session) {
         />
       )}
 
+      {view === "voice-onboarding" && <VoiceOnboarding />}
+
       {view === "wizard" && (
         <AgentWizard
           key={editingAgent?.id || "new"}
           initialForm={getInitialForm()}
+          accessToken={session.access_token}
           onBack={() => setView("dashboard")}
           onSave={handleSaveAgent}
           isEditing={!!editingAgent}
@@ -3328,7 +3253,7 @@ if (!session) {
       )}
 
       {useAgentTarget && (
-        <UseAgentModal agent={useAgentTarget} onClose={() => setUseAgentTarget(null)} />
+        <UseAgentModal agent={useAgentTarget} accessToken={session.access_token} onClose={() => setUseAgentTarget(null)} />
       )}
       {integrationTarget && (
         <IntegrateAgentModal
