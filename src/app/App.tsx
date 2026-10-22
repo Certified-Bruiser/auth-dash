@@ -2,6 +2,13 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { supabase } from '../lib/supabase'
 import VoiceOnboarding, { type AgentFields } from "./VoiceOnboarding.tsx";
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "./components/ui/dialog";
+import {
   Mic, Volume2, Brain, Database, MessageSquare, Wrench, Shield,
   Play, Upload, Search, Plus, Trash2, Copy, CheckCircle, Clock,
   AlertCircle, X, ArrowLeft, ArrowRight, Globe, Lock, Zap,
@@ -3007,6 +3014,7 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
 
   const [view, setView] = useState<View>("dashboard");
+  const [createModeOpen, setCreateModeOpen] = useState(false);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [, setProviderCatalogVersion] = useState(0);
   const [editingAgent, setEditingAgent] = useState<Agent | null>(null);
@@ -3120,9 +3128,19 @@ if (!session) {
 
 
   const handleCreateAgent = () => {
+    setCreateModeOpen(true);
+  };
+
+  const handleCreatePromptAgent = () => {
+    setCreateModeOpen(false);
     setEditingAgent(null);
     setOnboardingDraft(null);
     setView("wizard");
+  };
+
+  const handleCreateVoiceAgent = () => {
+    setCreateModeOpen(false);
+    setView("voice-onboarding");
   };
 
   const handleEditAgent = (agent: Agent) => {
@@ -3313,6 +3331,31 @@ if (!session) {
           </div>
         </div>
       </header>
+
+      <Dialog open={createModeOpen} onOpenChange={setCreateModeOpen}>
+        <DialogContent className="border-[rgba(99,102,241,0.2)] bg-[#0d1018] text-[#e2e4ef]">
+          <DialogHeader>
+            <DialogTitle style={{ fontFamily: "Outfit, sans-serif" }}>Choose an agent mode</DialogTitle>
+            <DialogDescription className="text-[#8b8da3]">
+              Select how you want to create your agent.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <button
+              onClick={handleCreatePromptAgent}
+              className="rounded-lg border border-[rgba(99,102,241,0.2)] bg-[#111520] px-4 py-3 text-left text-sm font-semibold text-[#e2e4ef] transition-colors hover:border-[#6366f1] hover:bg-[rgba(99,102,241,0.12)]"
+            >
+              Prompt Mode
+            </button>
+            <button
+              onClick={handleCreateVoiceAgent}
+              className="rounded-lg border border-[rgba(99,102,241,0.2)] bg-[#111520] px-4 py-3 text-left text-sm font-semibold text-[#e2e4ef] transition-colors hover:border-[#6366f1] hover:bg-[rgba(99,102,241,0.12)]"
+            >
+              Voice Agent Mode
+            </button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Views */}
       {view === "dashboard" && (
