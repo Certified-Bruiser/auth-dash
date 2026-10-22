@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { supabase } from '../lib/supabase'
-import VoiceOnboarding from "./VoiceOnboarding.tsx";
+import VoiceOnboarding, { type AgentFields } from "./VoiceOnboarding.tsx";
 import {
   Mic, Volume2, Brain, Database, MessageSquare, Wrench, Shield,
   Play, Upload, Search, Plus, Trash2, Copy, CheckCircle, Clock,
@@ -44,6 +44,7 @@ interface AgentForm {
   description: string;
   agentType: string;
   purpose: string;
+  businessContext: string;
   systemInstructions: string;
   personality: string;
   tone: string;
@@ -348,7 +349,7 @@ const WIZARD_STEPS = [
 ];
 
 const defaultForm: AgentForm = {
-  name: "", description: "", agentType: "customer-support", purpose: "",
+  name: "", description: "", agentType: "customer-support", purpose: "", businessContext: "",
   systemInstructions: "",
   personality: "friendly", tone: "warm", conversationStyle: "conversational", goals: "",
   sttProvider: "sarvam", sttModel: "saaras:v3",
@@ -697,11 +698,13 @@ interface StepProps { form: AgentForm; onChange: (updates: Partial<AgentForm>) =
 
 function PromptGeneratorModal({
   form,
+  accessToken,
   open,
   onClose,
   onApply,
 }: {
   form: AgentForm;
+  accessToken: string;
   open: boolean;
   onClose: () => void;
   onApply: (prompt: GeneratedPrompt) => void;
@@ -738,6 +741,7 @@ function PromptGeneratorModal({
     try {
       const generated = await apiRequest("/prompt-generator", {
         method: "POST",
+        accessToken,
         body: JSON.stringify({
           mode: selectedMode,
           configuration: {
@@ -915,6 +919,15 @@ function BasicsStep({ form, onChange, onGenerate }: StepProps) {
           placeholder="You are a helpful AI voice agent. Be concise and friendly..."
         />
         <p className="text-xs text-[#636680] mt-1.5">This is the core instruction prompt sent to the LLM. Be specific about role, constraints, and behaviors.</p>
+      </div>
+      <div>
+        <Label>Confirmed Business Context</Label>
+        <Textarea
+          rows={4}
+          value={form.businessContext}
+          onChange={e => onChange({ businessContext: e.target.value })}
+          placeholder="Owner-confirmed audience, products, services, and business rules"
+        />
       </div>
       <div className="grid grid-cols-3 gap-4">
         <div>
@@ -1712,16 +1725,6 @@ function TestStep({ form, agentId, accessToken }: { form: AgentForm; agentId?: s
 }
 
 function PublishStep({ form, onPublish, onSaveDraft }: { form: AgentForm; onPublish: () => void; onSaveDraft: () => void }) {
-  const [copied, setCopied] = useState<string | null>(null);
-  const agentId = `ag_${Math.random().toString(36).slice(2, 8)}`;
-  const embedCode = `<script src="https://voiceagent.ai/embed.js" data-agent="${agentId}" async></script>`;
-  const apiEndpoint = `POST https://api.voiceagent.ai/v1/agents/${agentId}/call`;
-
-  const copyToClipboard = (text: string, key: string) => {
-    setCopied(key);
-    setTimeout(() => setCopied(null), 2000);
-  };
-
   const configSummary = [
     { label: "STT", value: `${STT_PROVIDERS[form.sttProvider]?.name} · ${form.sttModel}`, icon: Mic },
     { label: "LLM", value: `${LLM_PROVIDERS[form.llmProvider]?.name} · ${form.llmModel}`, icon: Brain },
@@ -1735,7 +1738,7 @@ function PublishStep({ form, onPublish, onSaveDraft }: { form: AgentForm; onPubl
 
   return (
     <div className="space-y-6">
-      <SectionHeader icon={Zap} title="Save & Publish" subtitle="Review your configuration and publish your agent to production." />
+      <SectionHeader icon={Zap} title="Review & Publish" subtitle="Review your configuration, then explicitly approve it for production." />
 
       {/* Config summary */}
       <div className="p-4 bg-[#0a0d16] border border-[rgba(99,102,241,0.14)] rounded-xl">
@@ -1751,31 +1754,6 @@ function PublishStep({ form, onPublish, onSaveDraft }: { form: AgentForm; onPubl
               </div>
             );
           })}
-        </div>
-      </div>
-
-      {/* Deployment */}
-      <div className="space-y-3">
-        <h4 className="text-sm font-semibold text-[#e2e4ef]" style={{ fontFamily: "Outfit, sans-serif" }}>Deployment Options</h4>
-        <div className="p-3 bg-[#0a0d16] border border-[rgba(99,102,241,0.14)] rounded-lg">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-xs text-[#636680]">Embed Code</span>
-            <button onClick={() => copyToClipboard(embedCode, "embed")}
-              className="flex items-center gap-1 text-xs text-[#6366f1] hover:text-[#a78bfa] transition-colors">
-              {copied === "embed" ? <><Check className="w-3 h-3" /> Copied!</> : <><Copy className="w-3 h-3" /> Copy</>}
-            </button>
-          </div>
-          <code className="block text-xs text-[#636680] font-mono bg-[#07090f] px-2.5 py-2 rounded break-all">{embedCode}</code>
-        </div>
-        <div className="p-3 bg-[#0a0d16] border border-[rgba(99,102,241,0.14)] rounded-lg">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-xs text-[#636680]">REST API Endpoint</span>
-            <button onClick={() => copyToClipboard(apiEndpoint, "api")}
-              className="flex items-center gap-1 text-xs text-[#6366f1] hover:text-[#a78bfa] transition-colors">
-              {copied === "api" ? <><Check className="w-3 h-3" /> Copied!</> : <><Copy className="w-3 h-3" /> Copy</>}
-            </button>
-          </div>
-          <code className="block text-xs text-[#636680] font-mono bg-[#07090f] px-2.5 py-2 rounded">{apiEndpoint}</code>
         </div>
       </div>
 
@@ -1799,31 +1777,64 @@ function PublishStep({ form, onPublish, onSaveDraft }: { form: AgentForm; onPubl
 interface WizardProps {
   initialForm: AgentForm;
   accessToken: string;
+  onboardingSessionId?: string;
   onBack: () => void;
-  onSave: (form: AgentForm) => void;
+  onSave: (form: AgentForm, onboardingSessionId?: string, agentId?: string) => Promise<Agent>;
   isEditing: boolean;
   editingId?: string;
 }
 
-function AgentWizard({ initialForm, accessToken, onBack, onSave, isEditing, editingId }: WizardProps) {
+function AgentWizard({ initialForm, accessToken, onboardingSessionId, onBack, onSave, isEditing, editingId }: WizardProps) {
   const [form, setForm] = useState<AgentForm>(initialForm);
+  const [currentAgentId, setCurrentAgentId] = useState(editingId);
   const [step, setStep] = useState(0);
   const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
   const [promptGeneratorOpen, setPromptGeneratorOpen] = useState(false);
 
   const onChange = useCallback((updates: Partial<AgentForm>) => {
     setForm(prev => ({ ...prev, ...updates }));
   }, []);
 
-  const handleSave = (status: AgentStatus = form.status) => {
-    onSave({ ...form, status });
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+  const handleSave = async (status: AgentStatus = form.status) => {
+    setSaving(true);
+    setSaved(false);
+    setSaveError("");
+    try {
+      const agent = await onSave(
+        { ...form, status },
+        onboardingSessionId,
+        currentAgentId,
+      );
+      setCurrentAgentId(agent.id);
+      setSaved(true);
+      window.setTimeout(() => setSaved(false), 2000);
+      return agent;
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : "Agent draft could not be saved. Please retry.");
+      return null;
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const handlePublish = () => {
-    onSave({ ...form, status: "published" });
-    onBack();
+  const handlePublish = async () => {
+    if (!window.confirm("Approve this configuration and publish it now?")) return;
+    setSaving(true);
+    setSaveError("");
+    try {
+      const agent = await onSave({ ...form, status: "published" }, undefined, currentAgentId);
+      if (agent.status !== "published") {
+        throw new Error("The backend did not confirm that this agent was published.");
+      }
+      setForm(current => ({ ...current, status: agent.status }));
+      onBack();
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : "Agent could not be saved. Please retry.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const applyGeneratedPrompt = (generated: GeneratedPrompt) => {
@@ -1848,8 +1859,8 @@ function AgentWizard({ initialForm, accessToken, onBack, onSave, isEditing, edit
     <ToolsStep key={5} form={form} onChange={onChange} />,
     <MemoryStep key={6} form={form} onChange={onChange} />,
     <SecurityStep key={7} form={form} onChange={onChange} onGenerate={() => setPromptGeneratorOpen(true)} />,
-    <TestStep key={8} form={form} agentId={editingId} accessToken={accessToken} />,
-    <PublishStep key={9} form={form} onPublish={handlePublish} onSaveDraft={() => handleSave("draft")} />,
+    <TestStep key={8} form={form} agentId={currentAgentId} accessToken={accessToken} />,
+    <PublishStep key={9} form={form} onPublish={handlePublish} onSaveDraft={() => void handleSave("draft")} />,
   ];
 
   const groups = [
@@ -1857,6 +1868,8 @@ function AgentWizard({ initialForm, accessToken, onBack, onSave, isEditing, edit
     { label: "Test", steps: [8], color: "text-[#38bdf8]" },
     { label: "Publish", steps: [9], color: "text-[#22c55e]" },
   ];
+  const visibleSteps = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+  const stepPosition = visibleSteps.indexOf(step);
 
   const statusForStep = (i: number) => {
     if (i < step) return "done";
@@ -1864,9 +1877,18 @@ function AgentWizard({ initialForm, accessToken, onBack, onSave, isEditing, edit
     return "pending";
   };
 
+  const goToStep = async (target: number) => {
+    if (target === 8) {
+      const agent = await handleSave(form.status);
+      if (agent) setStep(target);
+      return;
+    }
+    setStep(target);
+  };
+
   return (
     <div className="flex flex-col h-full min-h-screen" style={{ fontFamily: "DM Sans, sans-serif" }}>
-      <PromptGeneratorModal form={form} open={promptGeneratorOpen} onClose={() => setPromptGeneratorOpen(false)} onApply={applyGeneratedPrompt} />
+      <PromptGeneratorModal form={form} accessToken={accessToken} open={promptGeneratorOpen} onClose={() => setPromptGeneratorOpen(false)} onApply={applyGeneratedPrompt} />
       {/* Top bar */}
       <div className="flex items-center gap-4 px-6 py-3.5 border-b border-[rgba(99,102,241,0.14)] bg-[#09090f] sticky top-0 z-30">
         <button onClick={onBack} className="flex items-center gap-1.5 text-sm text-[#636680] hover:text-[#e2e4ef] transition-colors">
@@ -1881,6 +1903,7 @@ function AgentWizard({ initialForm, accessToken, onBack, onSave, isEditing, edit
         </div>
         <div className="ml-auto flex items-center gap-2">
           {saved && <span className="text-xs text-[#22c55e] flex items-center gap-1"><Check className="w-3 h-3" /> Saved</span>}
+          {saving && <span className="text-xs text-[#a0a3b8]">Saving...</span>}
           {form.status === "published" && (
             <button
               onClick={() => alert("Opening live agent...")}
@@ -1906,7 +1929,7 @@ function AgentWizard({ initialForm, accessToken, onBack, onSave, isEditing, edit
                   return (
                     <button
                       key={i}
-                      onClick={() => setStep(i)}
+                      onClick={() => void goToStep(i)}
                       className={cn(
                         "w-full flex items-center gap-2.5 px-2 py-2 rounded-lg text-sm transition-all",
                         status === "active" ? "bg-[rgba(99,102,241,0.15)] text-[#e2e4ef]" :
@@ -1934,6 +1957,7 @@ function AgentWizard({ initialForm, accessToken, onBack, onSave, isEditing, edit
         {/* Main content */}
         <main className="flex-1 overflow-y-auto pb-24">
           <div className="max-w-2xl mx-auto px-6 py-8">
+            {saveError && <p role="alert" className="mb-4 text-sm text-[#f87171]">{saveError}</p>}
             {steps[step]}
           </div>
         </main>
@@ -1942,42 +1966,45 @@ function AgentWizard({ initialForm, accessToken, onBack, onSave, isEditing, edit
       {/* Sticky bottom bar */}
       <div className="fixed bottom-0 left-52 right-0 z-20 bg-[#09090f] border-t border-[rgba(99,102,241,0.14)] px-6 py-3 flex items-center gap-3">
         <button
-          onClick={() => setStep(Math.max(0, step - 1))}
-          disabled={step === 0}
+          onClick={() => setStep(visibleSteps[Math.max(0, stepPosition - 1)])}
+          disabled={stepPosition === 0}
           className="flex items-center gap-1.5 px-3 py-2 bg-[#111520] border border-[rgba(99,102,241,0.2)] text-[#636680] text-sm rounded-lg hover:text-[#b4b8cc] disabled:opacity-30 transition-all"
         >
           <ArrowLeft className="w-3.5 h-3.5" /> Back
         </button>
         <div className="flex-1 h-1 bg-[#111520] rounded-full overflow-hidden">
           <div className="h-full bg-gradient-to-r from-[#6366f1] to-[#a78bfa] rounded-full transition-all duration-300"
-            style={{ width: `${((step + 1) / WIZARD_STEPS.length) * 100}%` }} />
+            style={{ width: `${((stepPosition + 1) / visibleSteps.length) * 100}%` }} />
         </div>
-        <span className="text-xs text-[#3d4060] font-mono w-12 text-right">{step + 1}/{WIZARD_STEPS.length}</span>
+        <span className="text-xs text-[#3d4060] font-mono w-12 text-right">{stepPosition + 1}/{visibleSteps.length}</span>
         <button
-          onClick={() => handleSave()}
+          onClick={() => void handleSave("draft")}
+          disabled={saving}
           className="flex items-center gap-1.5 px-3 py-2 bg-[#171d2e] border border-[rgba(99,102,241,0.2)] text-[#b4b8cc] text-sm rounded-lg hover:border-[rgba(99,102,241,0.4)] transition-all"
         >
           <Clock className="w-3.5 h-3.5" /> Save Draft
         </button>
         <button
-          onClick={() => setStep(8)}
+          onClick={() => void goToStep(8)}
           className="flex items-center gap-1.5 px-3 py-2 bg-[rgba(56,189,248,0.1)] border border-[rgba(56,189,248,0.25)] text-[#38bdf8] text-sm rounded-lg hover:bg-[rgba(56,189,248,0.15)] transition-all"
         >
           <PlayCircle className="w-3.5 h-3.5" /> Test
         </button>
-        {step < WIZARD_STEPS.length - 1 ? (
+        {stepPosition < visibleSteps.length - 1 ? (
           <button
-            onClick={() => setStep(Math.min(WIZARD_STEPS.length - 1, step + 1))}
+            onClick={() => void goToStep(visibleSteps[stepPosition + 1])}
+            disabled={saving}
             className="flex items-center gap-1.5 px-4 py-2 bg-[#6366f1] text-white text-sm rounded-lg hover:bg-[#4f46e5] transition-colors font-medium"
           >
             Next <ArrowRight className="w-3.5 h-3.5" />
           </button>
         ) : (
           <button
-            onClick={handlePublish}
+            onClick={() => void handlePublish()}
+            disabled={saving}
             className="flex items-center gap-1.5 px-4 py-2 bg-[#22c55e] text-white text-sm rounded-lg hover:bg-[#16a34a] transition-colors font-medium"
           >
-            <Zap className="w-3.5 h-3.5" /> Publish
+            <><Zap className="w-3.5 h-3.5" /> Publish</>
           </button>
         )}
       </div>
@@ -2983,6 +3010,7 @@ export default function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [, setProviderCatalogVersion] = useState(0);
   const [editingAgent, setEditingAgent] = useState<Agent | null>(null);
+  const [onboardingDraft, setOnboardingDraft] = useState<{ sessionId: string; fields: AgentFields } | null>(null);
   const [useAgentTarget, setUseAgentTarget] = useState<Agent | null>(null);
   const [integrationTarget, setIntegrationTarget] = useState<Agent | null>(null);
 
@@ -3093,33 +3121,91 @@ if (!session) {
 
   const handleCreateAgent = () => {
     setEditingAgent(null);
+    setOnboardingDraft(null);
     setView("wizard");
   };
 
   const handleEditAgent = (agent: Agent) => {
     setEditingAgent(agent);
+    setOnboardingDraft(null);
     setView("wizard");
   };
 
-  const handleSaveAgent = async (form: AgentForm) => {
+  const handleSaveAgent = async (
+    form: AgentForm,
+    onboardingSessionId?: string,
+    agentId?: string,
+  ): Promise<Agent> => {
+    const currentAgentId = agentId || editingAgent?.id;
+    const payload: AgentForm & { onboarding_session_id?: string } = { ...form };
+    if (!currentAgentId && onboardingSessionId) {
+      payload.onboarding_session_id = onboardingSessionId;
+      payload.status = "draft";
+    }
     try {
       const data = await apiRequest(
-        editingAgent ? `/api/v1/agents/${editingAgent.id}` : "/api/v1/agents",
+        currentAgentId ? `/api/v1/agents/${currentAgentId}` : "/api/v1/agents",
         {
-          method: editingAgent ? "PATCH" : "POST",
-          body: JSON.stringify(form),
+          method: currentAgentId ? "PATCH" : "POST",
+          body: JSON.stringify(payload),
           accessToken: session?.access_token,
         },
       );
       const savedAgent = mapAgent(data);
 
-      setAgents(prev => editingAgent
+      setAgents(prev => prev.some(agent => agent.id === savedAgent.id)
         ? prev.map(agent => agent.id === savedAgent.id ? savedAgent : agent)
         : [savedAgent, ...prev]);
+      return savedAgent;
     } catch (error) {
-      console.error("Failed to save agent:", error);
-      window.alert(error instanceof Error ? error.message : "Failed to save agent");
+      throw new Error(error instanceof Error ? error.message : "Agent draft could not be saved. Please retry.");
     }
+  };
+
+  const handleOnboardingDraft = async (
+    sessionId: string,
+    fields: AgentFields,
+    associatedAgentId?: string | null,
+  ) => {
+    const initialForm: AgentForm = {
+      ...defaultForm,
+      name: fields.name || defaultForm.name,
+      description: fields.description || defaultForm.description,
+      purpose: fields.purpose || defaultForm.purpose,
+      businessContext: fields.businessContext || defaultForm.businessContext,
+      goals: fields.goals || defaultForm.goals,
+      tone: fields.tone || defaultForm.tone,
+      language: fields.language || defaultForm.language,
+      status: "draft",
+    };
+    let agent;
+    if (associatedAgentId) {
+      const existing = await apiRequest(`/api/v1/agents/${associatedAgentId}`, {
+        accessToken: session.access_token,
+      });
+      const existingForm = { ...defaultForm };
+      for (const field of Object.keys(defaultForm) as (keyof AgentForm)[]) {
+        if (existing[field] !== undefined) {
+          (existingForm as Record<keyof AgentForm, AgentForm[keyof AgentForm]>)[field] = existing[field];
+        }
+      }
+      agent = await handleSaveAgent({
+        ...existingForm,
+        name: initialForm.name,
+        description: initialForm.description,
+        purpose: initialForm.purpose,
+        businessContext: initialForm.businessContext,
+        goals: initialForm.goals,
+        tone: initialForm.tone,
+        language: initialForm.language,
+        status: "draft",
+      }, undefined, associatedAgentId);
+    } else {
+      agent = await handleSaveAgent(initialForm, sessionId);
+    }
+    setOnboardingDraft({ sessionId, fields });
+    setEditingAgent(agent);
+    setView("wizard");
   };
 
   const handleDuplicateAgent = async (agent: Agent) => {
@@ -3150,26 +3236,29 @@ if (!session) {
   };
 
   const getInitialForm = (): AgentForm => {
-    if (!editingAgent) return { ...defaultForm };
-    return {
-      ...defaultForm,
-      name: editingAgent.name, description: editingAgent.description,
-      agentType: editingAgent.agentType, status: editingAgent.status,
-      sttProvider: editingAgent.sttProvider, sttModel: editingAgent.sttModel,
-      llmProvider: editingAgent.llmProvider, llmModel: editingAgent.llmModel,
-      ttsProvider: editingAgent.ttsProvider, ttsModel: editingAgent.ttsModel,
-      voice: editingAgent.voice, language: editingAgent.language,
-      personality: editingAgent.personality, tone: editingAgent.tone,
-      purpose: (editingAgent as Partial<AgentForm>).purpose ?? defaultForm.purpose,
-      systemInstructions: (editingAgent as Partial<AgentForm>).systemInstructions ?? defaultForm.systemInstructions,
-      goals: (editingAgent as Partial<AgentForm>).goals ?? defaultForm.goals,
-      allowedTopics: (editingAgent as Partial<AgentForm>).allowedTopics ?? defaultForm.allowedTopics,
-      restrictedTopics: (editingAgent as Partial<AgentForm>).restrictedTopics ?? defaultForm.restrictedTopics,
-      escalationRules: (editingAgent as Partial<AgentForm>).escalationRules ?? defaultForm.escalationRules,
-      humanHandoffConditions: (editingAgent as Partial<AgentForm>).humanHandoffConditions ?? defaultForm.humanHandoffConditions,
-      conversationStyle: (editingAgent as Partial<AgentForm>).conversationStyle ?? defaultForm.conversationStyle,
-      knowledgeSources: (editingAgent as Partial<AgentForm>).knowledgeSources ?? defaultForm.knowledgeSources,
-    };
+    if (!editingAgent) {
+      if (!onboardingDraft) return { ...defaultForm };
+      const fields = onboardingDraft.fields;
+      return {
+        ...defaultForm,
+        name: fields.name || defaultForm.name,
+        description: fields.description || defaultForm.description,
+        purpose: fields.purpose || defaultForm.purpose,
+        businessContext: fields.businessContext || defaultForm.businessContext,
+        goals: fields.goals || defaultForm.goals,
+        tone: fields.tone || defaultForm.tone,
+        language: fields.language || defaultForm.language,
+        status: "draft",
+      };
+    }
+    const restored = { ...defaultForm };
+    const savedForm = editingAgent as unknown as Partial<AgentForm>;
+    for (const field of Object.keys(defaultForm) as (keyof AgentForm)[]) {
+      if (savedForm[field] !== undefined) {
+        (restored as Record<keyof AgentForm, AgentForm[keyof AgentForm]>)[field] = savedForm[field] as AgentForm[keyof AgentForm];
+      }
+    }
+    return restored;
   };
 
   return (
@@ -3238,13 +3327,14 @@ if (!session) {
         />
       )}
 
-      {view === "voice-onboarding" && <VoiceOnboarding />}
+      {view === "voice-onboarding" && <VoiceOnboarding onCreateDraft={handleOnboardingDraft} />}
 
       {view === "wizard" && (
         <AgentWizard
           key={editingAgent?.id || "new"}
           initialForm={getInitialForm()}
           accessToken={session.access_token}
+          onboardingSessionId={onboardingDraft?.sessionId}
           onBack={() => setView("dashboard")}
           onSave={handleSaveAgent}
           isEditing={!!editingAgent}

@@ -23,6 +23,29 @@ interface BusinessProfile {
   conflicts: Array<{ field: string; statement: string; quote: string; source: string }>;
 }
 
+export interface AgentFields {
+  name: string;
+  description: string;
+  purpose: string;
+  goals: string;
+  tone: string;
+  language: string;
+  businessContext: string;
+}
+
+interface OnboardingSessionSummary {
+  id: string;
+  profile: BusinessProfile;
+  created_at: string;
+  updated_at: string;
+  agent_id: string | null;
+  completion_recorded?: boolean;
+}
+
+interface VoiceOnboardingProps {
+  onCreateDraft: (sessionId: string, fields: AgentFields, associatedAgentId?: string | null) => Promise<void>;
+}
+
 interface ResearchJob {
   id: string;
   target: string;
@@ -65,7 +88,16 @@ type SpeechRecognitionWindow = Window & {
   webkitSpeechRecognition?: SpeechRecognitionConstructor;
 };
 
-const greeting = "Hi! I'm here to understand your business and what you'd like help with. Tell me a little about what you do.";
+const greeting = "Hi! What does your business do?";
+const editableProfileFields = [
+  "business_name", "description", "industry", "location", "brands", "products_services",
+  "target_customers", "customer_needs", "agent_purpose", "agent_responsibilities",
+  "communication_tone", "language", "business_rules",
+] as const;
+const listProfileFields = new Set<string>([
+  "brands", "products_services", "target_customers", "customer_needs",
+  "agent_responsibilities", "business_rules",
+]);
 
 function getRecognitionConstructor(): SpeechRecognitionConstructor | null {
   if (typeof window === "undefined") return null;
@@ -73,7 +105,7 @@ function getRecognitionConstructor(): SpeechRecognitionConstructor | null {
   return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null;
 }
 
-export default function VoiceOnboarding() {
+export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps) {
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isEnded, setIsEnded] = useState(false);
@@ -84,8 +116,12 @@ export default function VoiceOnboarding() {
   const [transcript, setTranscript] = useState("");
   const [assistantReply, setAssistantReply] = useState("");
   const [profile, setProfile] = useState<BusinessProfile | null>(null);
+  const [completionRecorded, setCompletionRecorded] = useState(false);
   const [research, setResearch] = useState<ResearchJob[]>([]);
-  const [researchNotice, setResearchNotice] = useState("");
+  const [savedSessions, setSavedSessions] = useState<OnboardingSessionSummary[]>([]);
+  const [associatedAgentId, setAssociatedAgentId] = useState<string | null>(null);
+  const [isSavingReview, setIsSavingReview] = useState(false);
+  const [profileDirty, setProfileDirty] = useState(false);
   const [voiceMessage, setVoiceMessage] = useState("");
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const researchPollInFlightRef = useRef(false);
@@ -140,18 +176,93 @@ export default function VoiceOnboarding() {
   };
 
   const beginOnboarding = async () => {
+    speakGreeting();
     setIsStarting(true);
     setVoiceMessage("");
     try {
       const data = await onboardingRequest("/sessions", { method: "POST" });
       setSessionId(data.id);
       setProfile(data.profile);
+      setCompletionRecorded(false);
+      setSavedSessions(current => [
+        {
+          id: data.id,
+          profile: data.profile,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          agent_id: null,
+        },
+        ...current.filter(item => item.id !== data.id),
+      ]);
+      setTranscript("");
+      capturedSpeechRef.current = "";
+      setResearch([]);
+      setAssociatedAgentId(null);
+      setProfileDirty(false);
       setConsented(true);
       setVoiceMessage("Onboarding is ready. Start speaking when you are.");
     } catch (error) {
       setVoiceMessage(error instanceof Error ? error.message : "Could not start onboarding.");
     } finally {
       setIsStarting(false);
+    }
+  };
+
+  const resumeOnboarding = async (id: string) => {
+    setIsStarting(true);
+    setVoiceMessage("");
+    try {
+      const data = await onboardingRequest(`/sessions/${id}`);
+      const savedTranscript: string[] = data.transcript || [];
+      setSessionId(data.id);
+      setProfile(data.profile);
+      setCompletionRecorded(Boolean(data.completion_recorded));
+      setTranscript(savedTranscript.join("\n"));
+      capturedSpeechRef.current = savedTranscript.join("\n");
+      setResearch(data.research || []);
+      setAssociatedAgentId(data.agent_id || null);
+      setProfileDirty(false);
+      endedRef.current = false;
+      setIsEnded(false);
+      setConsented(true);
+      setVoiceMessage("Onboarding session resumed.");
+    } catch (error) {
+      setVoiceMessage(error instanceof Error ? error.message : "This onboarding session could not be reopened.");
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
+  const updateProfileField = (field: typeof editableProfileFields[number], value: string) => {
+    setProfile(current => {
+      if (!current) return current;
+      const parsedValue = listProfileFields.has(field)
+        ? value.split("\n").map(item => item.trim()).filter(Boolean)
+        : value.trim() || null;
+      return { ...current, [field]: parsedValue };
+    });
+    setProfileDirty(true);
+  };
+
+  const continueToDraft = async () => {
+    if (!sessionId || !profile) return;
+    setIsSavingReview(true);
+    setVoiceMessage("");
+    try {
+      const payload = Object.fromEntries(
+        editableProfileFields.map(field => [field, profile[field]]),
+      );
+      const reviewed = await onboardingRequest(`/sessions/${sessionId}/profile`, {
+        method: "PATCH",
+        body: JSON.stringify(payload),
+      });
+      setProfile(reviewed.profile);
+      setProfileDirty(false);
+      await onCreateDraft(sessionId, reviewed.agent_fields, associatedAgentId);
+    } catch (error) {
+      setVoiceMessage(error instanceof Error ? error.message : "The reviewed profile could not be saved.");
+    } finally {
+      setIsSavingReview(false);
     }
   };
 
@@ -164,13 +275,13 @@ export default function VoiceOnboarding() {
         body: JSON.stringify({ text }),
       });
       setProfile(data.profile);
+      setCompletionRecorded(Boolean(data.completion_recorded));
       setResearch(data.research || []);
-      setResearchNotice(data.research_notice || "");
       if (data.assistant_reply) {
         setAssistantReply(data.assistant_reply);
         speakText(data.assistant_reply);
       }
-      setVoiceMessage(data.research_notice || "Your profile is updated. Relevant public-source research continues in the background.");
+      setVoiceMessage("Your profile is updated.");
     } catch (error) {
       setVoiceMessage(error instanceof Error ? error.message : "This turn could not be processed.");
     } finally {
@@ -179,10 +290,23 @@ export default function VoiceOnboarding() {
   };
 
   useEffect(() => {
-    speakGreeting();
     return () => {
       recognitionRef.current?.abort();
       window.speechSynthesis?.cancel();
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    onboardingRequest("/sessions")
+      .then(data => {
+        if (active) setSavedSessions(data.items || []);
+      })
+      .catch(error => {
+        if (active) setVoiceMessage(error instanceof Error ? error.message : "Saved sessions could not be loaded.");
+      });
+    return () => {
+      active = false;
     };
   }, []);
 
@@ -195,8 +319,10 @@ export default function VoiceOnboarding() {
       try {
         const data = await onboardingRequest(`/sessions/${sessionId}`);
         if (active) {
-          setProfile(data.profile);
+          if (!profileDirty) setProfile(data.profile);
+          setCompletionRecorded(Boolean(data.completion_recorded));
           setResearch(data.research || []);
+          setAssociatedAgentId(data.agent_id || null);
         }
       } catch {
         // Research status refreshes must not interrupt the voice session.
@@ -209,7 +335,7 @@ export default function VoiceOnboarding() {
       active = false;
       window.clearInterval(timer);
     };
-  }, [sessionId, research]);
+  }, [sessionId, research, profileDirty]);
 
   const startListening = () => {
     if (!Recognition || isEnded || !consented || !sessionId) return;
@@ -313,10 +439,12 @@ export default function VoiceOnboarding() {
           </div>
 
           <div className="space-y-5 p-5 sm:p-8">
-            <div className="max-w-2xl rounded-lg border border-[rgba(99,102,241,0.14)] bg-[#111520] p-4 sm:p-5">
-              <p className="mb-2 text-xs font-medium uppercase tracking-wider text-[#a78bfa]">Assistant</p>
-              <p className="text-base leading-7 text-[#e2e4ef]">{greeting}</p>
-            </div>
+            {consented && !assistantReply && (
+              <div className="max-w-2xl rounded-lg border border-[rgba(99,102,241,0.14)] bg-[#111520] p-4 sm:p-5">
+                <p className="mb-2 text-xs font-medium uppercase tracking-wider text-[#a78bfa]">Assistant</p>
+                <p className="text-base leading-7 text-[#e2e4ef]">{greeting}</p>
+              </div>
+            )}
 
             {transcript && (
               <div className="ml-auto max-w-2xl rounded-lg border border-[rgba(56,189,248,0.18)] bg-[rgba(56,189,248,0.06)] p-4 sm:p-5">
@@ -336,7 +464,7 @@ export default function VoiceOnboarding() {
               <div className="rounded-lg border border-[rgba(240,173,121,0.2)] bg-[rgba(240,173,121,0.06)] p-4">
                 <p className="text-sm font-semibold text-[#f0c59f]">Before you begin</p>
                 <p className="mt-1 text-sm leading-6 text-[#c5a98e]">
-                  Your recognized speech will be sent to our backend and AI provider and saved with your business profile. Relevant details may also be researched using public web sources and saved to your account.
+                  Your recognized speech will be sent to our backend and AI provider and saved with your business profile.
                 </p>
                 <button
                   type="button"
@@ -346,51 +474,80 @@ export default function VoiceOnboarding() {
                 >
                   {isStarting ? "Starting..." : "I agree and start"}
                 </button>
+                {savedSessions.length > 0 && (
+                  <div className="mt-5 border-t border-[rgba(240,173,121,0.14)] pt-4">
+                    <h2 className="text-sm font-semibold text-[#f0c59f]">Resume onboarding</h2>
+                    <ul className="mt-2 space-y-2">
+                      {savedSessions.map(savedSession => (
+                        <li key={savedSession.id} className="flex items-center justify-between gap-3 text-sm">
+                          <span className="min-w-0 truncate text-[#c5a98e]">
+                            {savedSession.profile.business_name || "Business profile in progress"} · {new Date(savedSession.updated_at).toLocaleDateString()}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => void resumeOnboarding(savedSession.id)}
+                            disabled={isStarting}
+                            className="shrink-0 rounded-md border border-[rgba(240,173,121,0.25)] px-3 py-1.5 text-xs text-[#f0c59f] hover:bg-[rgba(240,173,121,0.08)] disabled:opacity-50"
+                          >
+                            {savedSession.agent_id ? "Open linked draft" : "Resume"}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
               </div>
             ) : (
               <>
-                {profile && (
+                {profile && completionRecorded && (
                   <section className="border-t border-[rgba(99,102,241,0.12)] pt-5" aria-label="Business profile">
-                    <h2 className="text-sm font-semibold text-[#e2e4ef]">Business profile</h2>
-                    <dl className="mt-3 grid gap-x-6 gap-y-3 text-sm sm:grid-cols-2">
-                      {(["business_name", "description", "industry", "location", "brands", "products_services", "target_customers", "agent_purpose"] as const).map(field => {
+                    <h2 className="text-sm font-semibold text-[#e2e4ef]">Review business profile</h2>
+                    <p className="mt-1 text-xs text-[#a0a3b8]">Correct any details before they are used to configure the draft.</p>
+                    <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                      {editableProfileFields.map(field => {
                         const value = profile[field];
-                        if (!value || (Array.isArray(value) && value.length === 0)) return null;
                         const label = field.replace(/_/g, " ").replace(/^./, (char: string) => char.toUpperCase());
-                        return <div key={field}><dt className="text-xs capitalize text-[#a0a3b8]">{label}</dt><dd className="mt-1 text-[#d5d7e2]">{Array.isArray(value) ? value.join(", ") : value}</dd></div>;
+                        const textValue = Array.isArray(value) ? value.join("\n") : value || "";
+                        return (
+                          <label key={field} className="text-xs capitalize text-[#a0a3b8]">
+                            {label}
+                            {listProfileFields.has(field) ? (
+                              <textarea
+                                rows={2}
+                                value={textValue}
+                                onChange={event => updateProfileField(field, event.target.value)}
+                                className="mt-1 block w-full rounded-md border border-[rgba(99,102,241,0.18)] bg-[#111520] px-3 py-2 text-sm normal-case text-[#d5d7e2] outline-none focus:ring-1 focus:ring-[#6366f1]"
+                              />
+                            ) : (
+                              <input
+                                value={textValue}
+                                onChange={event => updateProfileField(field, event.target.value)}
+                                className="mt-1 block w-full rounded-md border border-[rgba(99,102,241,0.18)] bg-[#111520] px-3 py-2 text-sm normal-case text-[#d5d7e2] outline-none focus:ring-1 focus:ring-[#6366f1]"
+                              />
+                            )}
+                          </label>
+                        );
                       })}
-                    </dl>
+                    </div>
                     {profile.unresolved_questions.length > 0 && <p className="mt-3 text-xs text-[#a0a3b8]">Open details: {profile.unresolved_questions.join(" · ")}</p>}
                     {profile.unknowns.length > 0 && <p className="mt-2 text-xs text-[#71748a]">Not yet covered: {profile.unknowns.map(field => field.replace(/_/g, " ")).join(" · ")}</p>}
                     {profile.conflicts.length > 0 && <p className="mt-2 text-xs text-[#f0ad79]">Conflicting statements: {profile.conflicts.map(conflict => conflict.statement).join(" · ")}</p>}
-                    {researchNotice && <p className="mt-2 text-xs text-[#f0ad79">{researchNotice}</p>}
                   </section>
                 )}
 
-                {research.length > 0 && (
-                  <section className="border-t border-[rgba(99,102,241,0.12)] pt-5" aria-label="Public-source research">
-                    <h2 className="text-sm font-semibold text-[#e2e4ef]">Public-source research</h2>
-                    <div className="mt-3 space-y-4">
-                      {research.map(job => (
-                        <article key={job.id || job.target} className="border-l-2 border-[#7357e8] pl-3">
-                          <p className="text-xs text-[#a0a3b8]">{job.status === "running" || job.status === "pending" ? "Researching" : job.status === "failed" ? "Research unavailable" : "Research complete"}: {job.target}</p>
-                          {job.findings?.map((finding, index) => (
-                            <div key={`${finding.claim}-${index}`} className="mt-2">
-                              <p className="text-sm leading-6 text-[#d5d7e2]">{finding.claim}</p>
-                              {finding.uncertainty && <p className="text-xs text-[#a0a3b8]">Uncertainty: {finding.uncertainty}</p>}
-                              <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs">
-                                {finding.sources.map(url => <a key={url} href={url} target="_blank" rel="noreferrer" className="text-[#7dd3fc] underline underline-offset-2">{new URL(url).hostname}</a>)}
-                                <span className="text-[#71748a]">{finding.verification_status.replace(/_/g, " ")}</span>
-                              </div>
-                            </div>
-                          ))}
-                          {job.missing_details?.length > 0 && <p className="mt-2 text-xs text-[#a0a3b8]">Still unknown: {job.missing_details.join(" · ")}</p>}
-                          {job.error && <p className="mt-2 text-xs text-[#f0ad79]">{job.error}</p>}
-                        </article>
-                      ))}
-                    </div>
-                  </section>
+                {profile && completionRecorded && (
+                  <div className="border-t border-[rgba(99,102,241,0.12)] pt-4">
+                    <button
+                      type="button"
+                      onClick={() => void continueToDraft()}
+                      disabled={isSavingReview}
+                      className="rounded-md bg-[#7357e8] px-4 py-2 text-sm font-medium text-white hover:bg-[#6448d5] disabled:opacity-50"
+                    >
+                      {isSavingReview ? "Saving profile..." : associatedAgentId ? "Open linked draft" : "Configure agent draft"}
+                    </button>
+                  </div>
                 )}
+
               </>
             )}
 
@@ -406,7 +563,7 @@ export default function VoiceOnboarding() {
                 <button
                   type="button"
                   onClick={speakGreeting}
-                  disabled={!speechOutputAvailable || isEnded}
+                  disabled={!consented || !speechOutputAvailable || isEnded}
                   aria-label="Play greeting aloud"
                   title="Play greeting aloud"
                   className="flex h-11 w-11 items-center justify-center rounded-full border border-[rgba(99,102,241,0.22)] bg-[#171d2e] text-[#b4b8cc] transition-colors hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
