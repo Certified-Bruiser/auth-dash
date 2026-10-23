@@ -4,7 +4,7 @@ import { supabase } from "../lib/supabase";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
-interface BusinessProfile {
+export interface BusinessProfile {
   business_name: string | null;
   description: string | null;
   industry: string | null;
@@ -42,8 +42,16 @@ interface OnboardingSessionSummary {
   completion_recorded?: boolean;
 }
 
+type TranscriptTurn = string | { role: "user" | "assistant"; content: string };
+type ConversationMessage = { role: "user" | "assistant"; content: string };
+
 interface VoiceOnboardingProps {
-  onCreateDraft: (sessionId: string, fields: AgentFields, associatedAgentId?: string | null) => Promise<void>;
+  onCreateAgent: (
+    sessionId: string,
+    fields: AgentFields,
+    profile: BusinessProfile,
+    associatedAgentId?: string | null,
+  ) => Promise<{ id: string }>;
 }
 
 interface ResearchJob {
@@ -88,13 +96,13 @@ type SpeechRecognitionWindow = Window & {
   webkitSpeechRecognition?: SpeechRecognitionConstructor;
 };
 
-const greeting = "Hi! What does your business do?";
-const editableProfileFields = [
+const greeting = "Hi! I'd love to learn about your business. Tell me a little about what you do.";
+export const editableProfileFields = [
   "business_name", "description", "industry", "location", "brands", "products_services",
   "target_customers", "customer_needs", "agent_purpose", "agent_responsibilities",
   "communication_tone", "language", "business_rules",
 ] as const;
-const listProfileFields = new Set<string>([
+export const listProfileFields = new Set<string>([
   "brands", "products_services", "target_customers", "customer_needs",
   "agent_responsibilities", "business_rules",
 ]);
@@ -105,7 +113,7 @@ function getRecognitionConstructor(): SpeechRecognitionConstructor | null {
   return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null;
 }
 
-export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps) {
+export default function VoiceOnboarding({ onCreateAgent }: VoiceOnboardingProps) {
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isEnded, setIsEnded] = useState(false);
@@ -114,6 +122,7 @@ export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps)
   const [consented, setConsented] = useState(false);
   const [sessionId, setSessionId] = useState("");
   const [transcript, setTranscript] = useState("");
+  const [conversationMessages, setConversationMessages] = useState<ConversationMessage[]>([]);
   const [assistantReply, setAssistantReply] = useState("");
   const [profile, setProfile] = useState<BusinessProfile | null>(null);
   const [completionRecorded, setCompletionRecorded] = useState(false);
@@ -124,10 +133,11 @@ export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps)
   const [profileDirty, setProfileDirty] = useState(false);
   const [voiceMessage, setVoiceMessage] = useState("");
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const conversationRef = useRef<HTMLDivElement | null>(null);
   const researchPollInFlightRef = useRef(false);
   const transcriptRef = useRef("");
+  const lastSubmittedTurnRef = useRef("");
   const turnQueueRef = useRef<Promise<void>>(Promise.resolve());
-  const capturedSpeechRef = useRef("");
   const recognitionErrorRef = useRef(false);
   const endedRef = useRef(false);
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
@@ -156,7 +166,7 @@ export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps)
     window.speechSynthesis.speak(utterance);
   };
 
-  const speakGreeting = () => speakText(greeting);
+  const replayAssistantReply = () => speakText(assistantReply || greeting);
 
   const onboardingRequest = async (path: string, init: RequestInit = {}) => {
     const { data: { session } } = await supabase.auth.getSession();
@@ -176,13 +186,18 @@ export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps)
   };
 
   const beginOnboarding = async () => {
-    speakGreeting();
     setIsStarting(true);
     setVoiceMessage("");
     try {
       const data = await onboardingRequest("/sessions", { method: "POST" });
       setSessionId(data.id);
       setProfile(data.profile);
+      const firstReply = typeof data.assistant_reply === "string" && data.assistant_reply.trim()
+        ? data.assistant_reply
+        : greeting;
+      setConversationMessages([{ role: "assistant", content: firstReply }]);
+      setAssistantReply(firstReply);
+      speakText(firstReply);
       setCompletionRecorded(false);
       setSavedSessions(current => [
         {
@@ -195,7 +210,8 @@ export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps)
         ...current.filter(item => item.id !== data.id),
       ]);
       setTranscript("");
-      capturedSpeechRef.current = "";
+      transcriptRef.current = "";
+      lastSubmittedTurnRef.current = "";
       setResearch([]);
       setAssociatedAgentId(null);
       setProfileDirty(false);
@@ -213,12 +229,26 @@ export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps)
     setVoiceMessage("");
     try {
       const data = await onboardingRequest(`/sessions/${id}`);
-      const savedTranscript: string[] = data.transcript || [];
+      const savedTranscript: TranscriptTurn[] = data.transcript || [];
+      const savedMessages: ConversationMessage[] = savedTranscript.flatMap(turn => {
+        if (typeof turn === "string") return [{ role: "user", content: turn }];
+        if ((turn.role === "user" || turn.role === "assistant") && typeof turn.content === "string") {
+          return [{ role: turn.role, content: turn.content }];
+        }
+        return [];
+      });
+      const latestAssistantReply = [...savedTranscript].reverse().find(
+        (turn): turn is { role: "assistant"; content: string } =>
+          typeof turn !== "string" && turn.role === "assistant",
+      )?.content || data.assistant_reply || "";
       setSessionId(data.id);
       setProfile(data.profile);
       setCompletionRecorded(Boolean(data.completion_recorded));
-      setTranscript(savedTranscript.join("\n"));
-      capturedSpeechRef.current = savedTranscript.join("\n");
+      setTranscript("");
+      transcriptRef.current = "";
+      setConversationMessages(savedMessages);
+      setAssistantReply(latestAssistantReply);
+      lastSubmittedTurnRef.current = "";
       setResearch(data.research || []);
       setAssociatedAgentId(data.agent_id || null);
       setProfileDirty(false);
@@ -257,8 +287,13 @@ export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps)
         body: JSON.stringify(payload),
       });
       setProfile(reviewed.profile);
+      setCompletionRecorded(Boolean(reviewed.completion_recorded));
       setProfileDirty(false);
-      await onCreateDraft(sessionId, reviewed.agent_fields, associatedAgentId);
+      const agent = await onCreateAgent(sessionId, reviewed.agent_fields, reviewed.profile, associatedAgentId);
+      setAssociatedAgentId(agent.id);
+      setSavedSessions(current => current.map(item =>
+        item.id === sessionId ? { ...item, agent_id: agent.id } : item,
+      ));
     } catch (error) {
       setVoiceMessage(error instanceof Error ? error.message : "The reviewed profile could not be saved.");
     } finally {
@@ -267,22 +302,35 @@ export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps)
   };
 
   const submitTurn = async (text: string) => {
-    if (!sessionId || endedRef.current) return;
+    const normalizedText = text.trim();
+    if (!sessionId || endedRef.current || !normalizedText || lastSubmittedTurnRef.current === normalizedText) return;
+    lastSubmittedTurnRef.current = normalizedText;
+    setAssistantReply("");
     setIsProcessing(true);
     try {
       const data = await onboardingRequest(`/sessions/${sessionId}/turns`, {
         method: "POST",
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text: normalizedText }),
       });
       setProfile(data.profile);
       setCompletionRecorded(Boolean(data.completion_recorded));
       setResearch(data.research || []);
-      if (data.assistant_reply) {
+      const assistantMessage = typeof data.assistant_reply === "string" ? data.assistant_reply.trim() : "";
+      setConversationMessages(current => [
+        ...current,
+        { role: "user", content: normalizedText },
+        ...(assistantMessage ? [{ role: "assistant" as const, content: assistantMessage }] : []),
+      ]);
+      setTranscript(current => current.trim() === normalizedText ? "" : current);
+      if (typeof data.assistant_reply === "string" && data.assistant_reply.trim()) {
         setAssistantReply(data.assistant_reply);
         speakText(data.assistant_reply);
+        setVoiceMessage("Your profile is updated.");
+      } else {
+        setVoiceMessage("Your answer was saved, but no reply was returned. You can continue or resume this session later.");
       }
-      setVoiceMessage("Your profile is updated.");
     } catch (error) {
+      lastSubmittedTurnRef.current = "";
       setVoiceMessage(error instanceof Error ? error.message : "This turn could not be processed.");
     } finally {
       setIsProcessing(false);
@@ -295,6 +343,11 @@ export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps)
       window.speechSynthesis?.cancel();
     };
   }, []);
+
+  useEffect(() => {
+    const conversation = conversationRef.current;
+    if (conversation) conversation.scrollTop = conversation.scrollHeight;
+  }, [conversationMessages, transcript, isProcessing]);
 
   useEffect(() => {
     let active = true;
@@ -342,6 +395,7 @@ export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps)
 
     const recognition = new Recognition();
     transcriptRef.current = "";
+    setTranscript("");
     recognitionErrorRef.current = false;
     setVoiceMessage("");
     recognition.continuous = true;
@@ -354,7 +408,7 @@ export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps)
         .join(" ")
         .trim();
       transcriptRef.current = spokenText;
-      setTranscript([capturedSpeechRef.current, spokenText].filter(Boolean).join("\n"));
+      setTranscript(spokenText);
     };
     recognition.onerror = event => {
       recognitionErrorRef.current = true;
@@ -374,10 +428,7 @@ export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps)
       setIsListening(false);
       if (endedRef.current) return;
       if (transcriptRef.current) {
-        capturedSpeechRef.current = [capturedSpeechRef.current, transcriptRef.current]
-          .filter(Boolean)
-          .join("\n");
-        setTranscript(capturedSpeechRef.current);
+        setTranscript(transcriptRef.current);
         setVoiceMessage("Processing your latest turn...");
         const turn = transcriptRef.current;
         turnQueueRef.current = turnQueueRef.current
@@ -439,24 +490,30 @@ export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps)
           </div>
 
           <div className="space-y-5 p-5 sm:p-8">
-            {consented && !assistantReply && (
-              <div className="max-w-2xl rounded-lg border border-[rgba(99,102,241,0.14)] bg-[#111520] p-4 sm:p-5">
-                <p className="mb-2 text-xs font-medium uppercase tracking-wider text-[#a78bfa]">Assistant</p>
-                <p className="text-base leading-7 text-[#e2e4ef]">{greeting}</p>
-              </div>
-            )}
+            {consented && (
+              <div ref={conversationRef} className="max-h-[min(50vh,30rem)] space-y-4 overflow-y-auto pr-1" aria-live="polite" aria-label="Conversation">
+                {conversationMessages.map((message, index) => (
+                  <div
+                    key={`${index}-${message.role}`}
+                    className={`w-fit max-w-[90%] rounded-lg border p-4 sm:max-w-2xl sm:p-5 ${message.role === "user"
+                      ? "ml-auto border-[rgba(56,189,248,0.18)] bg-[rgba(56,189,248,0.06)]"
+                      : "mr-auto border-[rgba(99,102,241,0.14)] bg-[#111520]"}`}
+                  >
+                    <p className={`mb-2 text-xs font-medium uppercase tracking-wider ${message.role === "user" ? "text-[#7dd3fc]" : "text-[#a78bfa]"}`}>
+                      {message.role === "user" ? "You" : "Assistant"}
+                    </p>
+                    <p className="whitespace-pre-wrap text-sm leading-6 text-[#e2e4ef]">{message.content}</p>
+                  </div>
+                ))}
 
-            {transcript && (
-              <div className="ml-auto max-w-2xl rounded-lg border border-[rgba(56,189,248,0.18)] bg-[rgba(56,189,248,0.06)] p-4 sm:p-5">
-                <p className="mb-2 text-xs font-medium uppercase tracking-wider text-[#7dd3fc]">Recognized speech</p>
-                <p className="text-sm leading-6 text-[#c5c7d5]">{transcript}</p>
-              </div>
-            )}
+                {transcript && (
+                  <div className="ml-auto w-fit max-w-[90%] rounded-lg border border-[rgba(56,189,248,0.18)] bg-[rgba(56,189,248,0.06)] p-4 sm:max-w-2xl sm:p-5">
+                    <p className="mb-2 text-xs font-medium uppercase tracking-wider text-[#7dd3fc]">You</p>
+                    <p className="whitespace-pre-wrap text-sm leading-6 text-[#c5c7d5]">{transcript}</p>
+                  </div>
+                )}
 
-            {assistantReply && (
-              <div className="max-w-2xl rounded-lg border border-[rgba(99,102,241,0.14)] bg-[#111520] p-4 sm:p-5">
-                <p className="mb-2 text-xs font-medium uppercase tracking-wider text-[#a78bfa]">Assistant</p>
-                <p className="text-sm leading-6 text-[#e2e4ef]">{assistantReply}</p>
+                {isProcessing && <p className="text-xs text-[#a0a3b8]" role="status">Updating profile...</p>}
               </div>
             )}
 
@@ -530,7 +587,6 @@ export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps)
                       })}
                     </div>
                     {profile.unresolved_questions.length > 0 && <p className="mt-3 text-xs text-[#a0a3b8]">Open details: {profile.unresolved_questions.join(" · ")}</p>}
-                    {profile.unknowns.length > 0 && <p className="mt-2 text-xs text-[#71748a]">Not yet covered: {profile.unknowns.map(field => field.replace(/_/g, " ")).join(" · ")}</p>}
                     {profile.conflicts.length > 0 && <p className="mt-2 text-xs text-[#f0ad79]">Conflicting statements: {profile.conflicts.map(conflict => conflict.statement).join(" · ")}</p>}
                   </section>
                 )}
@@ -540,10 +596,10 @@ export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps)
                     <button
                       type="button"
                       onClick={() => void continueToDraft()}
-                      disabled={isSavingReview}
+                      disabled={isSavingReview || (!completionRecorded && !associatedAgentId)}
                       className="rounded-md bg-[#7357e8] px-4 py-2 text-sm font-medium text-white hover:bg-[#6448d5] disabled:opacity-50"
                     >
-                      {isSavingReview ? "Saving profile..." : associatedAgentId ? "Open linked draft" : "Configure agent draft"}
+                      {isSavingReview ? "Creating agent..." : associatedAgentId ? "Open linked agent testing" : "Create agent and start testing"}
                     </button>
                   </div>
                 )}
@@ -562,10 +618,10 @@ export default function VoiceOnboarding({ onCreateDraft }: VoiceOnboardingProps)
               <div className="flex flex-wrap items-center justify-center gap-3">
                 <button
                   type="button"
-                  onClick={speakGreeting}
+                  onClick={replayAssistantReply}
                   disabled={!consented || !speechOutputAvailable || isEnded}
-                  aria-label="Play greeting aloud"
-                  title="Play greeting aloud"
+                  aria-label={assistantReply ? "Replay assistant reply" : "Play greeting aloud"}
+                  title={assistantReply ? "Replay assistant reply" : "Play greeting aloud"}
                   className="flex h-11 w-11 items-center justify-center rounded-full border border-[rgba(99,102,241,0.22)] bg-[#171d2e] text-[#b4b8cc] transition-colors hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   <Volume2 className="h-4 w-4" aria-hidden="true" />

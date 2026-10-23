@@ -1,6 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { supabase } from '../lib/supabase'
-import VoiceOnboarding, { type AgentFields } from "./VoiceOnboarding.tsx";
+import VoiceOnboarding, {
+  editableProfileFields,
+  listProfileFields,
+  type AgentFields,
+  type BusinessProfile,
+} from "./VoiceOnboarding.tsx";
 import {
   Dialog,
   DialogContent,
@@ -24,7 +29,7 @@ import {
 // ─── TYPES ────────────────────────────────────────────────────────────────────
 
 type AgentStatus = "draft" | "testing" | "published";
-type View = "dashboard" | "wizard" | "voice-onboarding" | "use-agent";
+type View = "dashboard" | "wizard" | "voice-onboarding" | "voice-test" | "use-agent";
 
 interface Agent {
   id: string;
@@ -110,6 +115,33 @@ interface TestMessage {
   latency?: number;
 }
 
+interface TestSpeechRecognitionResult {
+  readonly 0: { readonly transcript: string };
+}
+
+interface TestSpeechRecognitionEvent extends Event {
+  readonly results: ArrayLike<TestSpeechRecognitionResult>;
+}
+
+interface TestSpeechRecognition {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onstart: (() => void) | null;
+  onresult: ((event: TestSpeechRecognitionEvent) => void) | null;
+  onerror: (() => void) | null;
+  onend: (() => void) | null;
+  start(): void;
+  stop(): void;
+  abort(): void;
+}
+
+type TestSpeechRecognitionConstructor = new () => TestSpeechRecognition;
+type TestSpeechRecognitionWindow = Window & {
+  SpeechRecognition?: TestSpeechRecognitionConstructor;
+  webkitSpeechRecognition?: TestSpeechRecognitionConstructor;
+};
+
 interface GeneratedPrompt {
   purpose: string;
   systemInstructions: string;
@@ -149,9 +181,29 @@ let STT_PROVIDERS: Record<string, { name: string; badge: string; models: { id: s
     name: "Azure Speech", badge: "AZ",
     models: [{ id: "standard", name: "Standard" }, { id: "premium", name: "Neural Premium" }],
   },
+  sarvam: {
+    name: "Sarvam Streaming", badge: "SAR",
+    models: [{ id: "saaras:v3", name: "saaras:v3" }],
+  },
 };
 
-let LLM_PROVIDERS: Record<string, { name: string; badge: string; models: { id: string; name: string; context: string }[] }> = {};
+let LLM_PROVIDERS: Record<string, { name: string; badge: string; models: { id: string; name: string; context: string }[] }> = {
+  deepseek: {
+    name: "DeepSeek", badge: "DS",
+    models: [
+      { id: "deepseek-flash", name: "deepseek-flash", context: "" },
+      { id: "deepseek-v4-pro", name: "deepseek-v4-pro", context: "" },
+    ],
+  },
+  gemini: {
+    name: "Gemini", badge: "GEM",
+    models: [{ id: "gemini-3.1-flash-lite", name: "gemini-3.1-flash-lite", context: "" }],
+  },
+  perplexity: {
+    name: "Perplexity Sonar", badge: "PER",
+    models: [{ id: "sonar", name: "sonar", context: "" }],
+  },
+};
 
 interface VoiceOption { id: string; name: string; gender: string; accent: string; style: string }
 let TTS_PROVIDERS: Record<string, {
@@ -159,6 +211,29 @@ let TTS_PROVIDERS: Record<string, {
   models: { id: string; name: string }[];
   voices: Record<string, VoiceOption[]>;
 }> = {
+  piper: {
+    name: "Piper", badge: "PIP",
+    models: [],
+    voices: {},
+  },
+  sarvam: {
+    name: "Sarvam Streaming", badge: "SAR",
+    models: [{ id: "bulbul:v3", name: "bulbul:v3" }],
+    voices: {
+      "bulbul:v3": [
+        { id: "rahul", name: "rahul", gender: "", accent: "", style: "" },
+      ],
+    },
+  },
+  deepgram: {
+    name: "Deepgram Aura", badge: "DG",
+    models: [{ id: "aura-2-thalia-en", name: "aura-2-thalia-en" }],
+    voices: {
+      "aura-2-thalia-en": [
+        { id: "aura-2-thalia-en", name: "aura-2-thalia-en", gender: "", accent: "", style: "" },
+      ],
+    },
+  },
   elevenlabs: {
     name: "ElevenLabs", badge: "EL",
     models: [
@@ -325,12 +400,6 @@ function applyProviderCatalog(catalog: {
   }]));
 }
 
-applyProviderCatalog({
-  stt: [],
-  llm: [],
-  tts: [],
-});
-
 const AVAILABLE_TOOLS = [
   { id: "calendar", name: "Calendar & Scheduling", icon: Calendar, description: "Book meetings, check availability, manage appointments", badge: "Popular" },
   { id: "crm", name: "CRM Integration", icon: User, description: "Sync contacts, log calls, update records in Salesforce/HubSpot", badge: "" },
@@ -374,6 +443,34 @@ const defaultForm: AgentForm = {
   requireConfirmation: false, gdprCompliant: true,
   status: "draft",
 };
+
+function voiceAgentForm(fields: AgentFields): AgentForm {
+  const identity = fields.name || "Business Assistant";
+  const instructions = [
+    `You are the customer-facing assistant for ${identity}.`,
+    fields.purpose ? `Your purpose is: ${fields.purpose}.` : "",
+    fields.goals ? `Your responsibilities are:\n${fields.goals}` : "",
+    fields.businessContext ? `Use these owner-confirmed business details:\n${fields.businessContext}` : "",
+    fields.tone ? `Use a ${fields.tone} tone.` : "",
+    fields.language ? `Communicate in ${fields.language}.` : "",
+    "Follow the confirmed business rules. Do not invent business facts, policies, prices, product details, guarantees, or capabilities.",
+  ].filter(Boolean).join("\n\n");
+
+  return {
+    ...defaultForm,
+    name: identity,
+    description: fields.description,
+    llmProvider: "deepseek",
+    llmModel: "deepseek-flash",
+    purpose: fields.purpose,
+    businessContext: fields.businessContext,
+    goals: fields.goals,
+    tone: fields.tone || defaultForm.tone,
+    language: fields.language || defaultForm.language,
+    systemInstructions: instructions,
+    status: "draft",
+  };
+}
 
 // ─── UI UTILITIES ─────────────────────────────────────────────────────────────
 
@@ -530,6 +627,18 @@ function mapAgent(data: any): Agent {
     lastUpdated: data.updated_at?.split("T")[0] || data.lastUpdated || "",
     totalCalls: data.totalCalls || 0,
   } as Agent;
+}
+
+function formFromAgent(agent: Agent): AgentForm {
+  const restored = { ...defaultForm };
+  const configured = agent as Agent & Partial<AgentForm>;
+  for (const field of Object.keys(defaultForm) as (keyof AgentForm)[]) {
+    if (configured[field] !== undefined) {
+      (restored as Record<keyof AgentForm, AgentForm[keyof AgentForm]>)[field] =
+        configured[field] as AgentForm[keyof AgentForm];
+    }
+  }
+  return restored;
 }
 
 function StatusBadge({ status }: { status: AgentStatus }) {
@@ -1538,29 +1647,30 @@ function SecurityStep({ form, onChange, onGenerate }: StepProps) {
   );
 }
 
-const MOCK_RESPONSES = [
-  "Thanks for reaching out! I'd be happy to help with that. Could you give me a bit more context?",
-  "Got it! Let me look that up for you right now.",
-  "That's a great question. Based on our knowledge base, the answer is that you can find this in your account settings under the Billing tab.",
-  "I understand your concern. I'm pulling up your account information now.",
-  "Absolutely! I can help you with that. Just to confirm, you're asking about the Pro plan pricing?",
-];
-
-function TestStep({ form, agentId, accessToken }: { form: AgentForm; agentId?: string; accessToken: string }) {
+function TestStep({ form, agentId, accessToken, showConfiguredGreeting = true }: {
+  form: AgentForm;
+  agentId?: string;
+  accessToken: string;
+  showConfiguredGreeting?: boolean;
+}) {
   const [messages, setMessages] = useState<TestMessage[]>([]);
   const [input, setInput] = useState("");
   const [isRecording, setIsRecording] = useState(false);
+  const [recordingError, setRecordingError] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
   const [pipeline, setPipeline] = useState<"idle" | "stt" | "llm" | "tts">("idle");
   const [sessionActive, setSessionActive] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
-  const responseIdx = useRef(0);
+  const recognitionRef = useRef<TestSpeechRecognition | null>(null);
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+  useEffect(() => () => recognitionRef.current?.abort(), []);
 
   const startSession = () => {
     setSessionActive(true);
-    setMessages([{ id: "0", role: "agent", content: form.greeting || "Hi! How can I help you today?", timestamp: new Date().toLocaleTimeString() }]);
+    setMessages(showConfiguredGreeting
+      ? [{ id: "0", role: "agent", content: form.greeting || "Hi! How can I help you today?", timestamp: new Date().toLocaleTimeString() }]
+      : []);
   };
 
   const sendMessage = async (text: string) => {
@@ -1594,11 +1704,47 @@ function TestStep({ form, agentId, accessToken }: { form: AgentForm; agentId?: s
 
   const toggleRecording = () => {
     if (isRecording) {
-      setIsRecording(false);
-      sendMessage("I have a question about my billing statement.");
-    } else {
+      recognitionRef.current?.stop();
+      return;
+    }
+
+    const speechWindow = window as TestSpeechRecognitionWindow;
+    const Recognition = speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
+    if (!Recognition) {
+      setRecordingError("Speech recognition is not supported in this browser. Type your message instead.");
+      return;
+    }
+
+    const recognition = new Recognition();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = navigator.language || "en-US";
+    recognition.onstart = () => {
+      setRecordingError("");
       setIsRecording(true);
-      setTimeout(() => { setIsRecording(false); sendMessage("I have a question about my billing statement."); }, 2500);
+    };
+    recognition.onresult = event => {
+      const spokenText = Array.from(event.results)
+        .map(result => result[0].transcript)
+        .join(" ")
+        .trim();
+      if (spokenText) void sendMessage(spokenText);
+    };
+    recognition.onerror = () => {
+      setRecordingError("Speech recognition failed. Try again or type your message.");
+      setIsRecording(false);
+    };
+    recognition.onend = () => {
+      recognitionRef.current = null;
+      setIsRecording(false);
+    };
+    recognitionRef.current = recognition;
+    try {
+      recognition.start();
+    } catch {
+      recognitionRef.current = null;
+      setIsRecording(false);
+      setRecordingError("Could not start speech recognition. Try again or type your message.");
     }
   };
 
@@ -1613,6 +1759,7 @@ function TestStep({ form, agentId, accessToken }: { form: AgentForm; agentId?: s
   return (
     <div className="space-y-4">
       <SectionHeader icon={PlayCircle} title="Live Voice Playground" subtitle="Test your agent end-to-end before publishing. Speak or type to interact." />
+      {recordingError && <p role="alert" className="text-sm text-[#f87171]">{recordingError}</p>}
 
       {/* Pipeline status */}
       <div className="flex items-center gap-2 p-3 bg-[#0a0d16] border border-[rgba(99,102,241,0.14)] rounded-xl">
@@ -1715,7 +1862,7 @@ function TestStep({ form, agentId, accessToken }: { form: AgentForm; agentId?: s
               <input
                 value={input} onChange={e => setInput(e.target.value)}
                 onKeyDown={e => { if (e.key === "Enter") sendMessage(input); }}
-                placeholder={isRecording ? "Recording..." : "Type or hold mic to speak..."}
+                placeholder={isRecording ? "Listening..." : "Type or click mic to speak..."}
                 disabled={isRecording || isProcessing}
                 className="flex-1 px-3 py-2 bg-[#111520] border border-[rgba(99,102,241,0.18)] rounded-lg text-sm text-[#e2e4ef] placeholder-[#3d4060] outline-none focus:ring-1 focus:ring-[#6366f1] disabled:opacity-50"
               />
@@ -1728,6 +1875,158 @@ function TestStep({ form, agentId, accessToken }: { form: AgentForm; agentId?: s
         )}
       </div>
     </div>
+  );
+}
+
+function VoiceAgentWorkspace({
+  agent,
+  profile: initialProfile,
+  sessionId,
+  accessToken,
+  onBack,
+  onSave,
+}: {
+  agent: Agent;
+  profile: BusinessProfile;
+  sessionId: string;
+  accessToken: string;
+  onBack: () => void;
+  onSave: (
+    sessionId: string,
+    agent: Agent,
+    form: AgentForm,
+    profile: BusinessProfile,
+  ) => Promise<{ agent: Agent; profile: BusinessProfile }>;
+}) {
+  const [form, setForm] = useState(() => formFromAgent(agent));
+  const [profile, setProfile] = useState(initialProfile);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const updateProfile = (field: typeof editableProfileFields[number], value: string) => {
+    setProfile(current => ({
+      ...current,
+      [field]: listProfileFields.has(field)
+        ? value.split("\n").map(item => item.trim()).filter(Boolean)
+        : value.trim() || null,
+    } as BusinessProfile));
+  };
+  const updateConfiguration = (
+    field: "name" | "description" | "purpose" | "goals" | "tone" | "language" | "systemInstructions",
+    value: string,
+  ) => setForm(current => ({ ...current, [field]: value }));
+
+  const saveReview = async () => {
+    setSaving(true);
+    setError("");
+    try {
+      const saved = await onSave(sessionId, agent, form, profile);
+      setForm(formFromAgent(saved.agent));
+      setProfile(saved.profile);
+      setReviewOpen(false);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : "Information could not be saved.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <main className="min-h-screen bg-[#07090f] px-4 py-8 sm:px-6">
+      <div className="mx-auto max-w-4xl">
+        <header className="mb-6 flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            onClick={onBack}
+            className="rounded-md border border-[rgba(99,102,241,0.2)] px-3 py-2 text-sm text-[#b4b8cc] hover:text-white"
+          >
+            Agents
+          </button>
+          <div className="min-w-0 flex-1">
+            <h1 className="truncate text-xl font-semibold text-[#e2e4ef]">{agent.name}</h1>
+            <p className="text-xs text-[#8b8da3]">Agent testing</p>
+          </div>
+          <StatusBadge status={agent.status} />
+          <button
+            type="button"
+            onClick={() => { setError(""); setReviewOpen(value => !value); }}
+            className="rounded-md bg-[#7357e8] px-4 py-2 text-sm font-medium text-white hover:bg-[#6448d5]"
+          >
+            {reviewOpen ? "Back to testing" : "Review Information"}
+          </button>
+        </header>
+
+        {error && <p role="alert" className="mb-4 text-sm text-[#f87171]">{error}</p>}
+        {reviewOpen ? (
+          <section className="space-y-6 rounded-xl border border-[rgba(99,102,241,0.18)] bg-[#0d1018] p-5 sm:p-7">
+            <div>
+              <h2 className="text-lg font-semibold text-[#e2e4ef]">Business information</h2>
+              <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                {editableProfileFields.map(field => {
+                  const value = profile[field];
+                  const label = field.replace(/_/g, " ").replace(/^./, character => character.toUpperCase());
+                  const textValue = Array.isArray(value) ? value.join("\n") : value || "";
+                  return (
+                    <label key={field} className="text-xs capitalize text-[#a0a3b8]">
+                      {label}
+                      {listProfileFields.has(field) ? (
+                        <textarea
+                          rows={3}
+                          value={textValue}
+                          onChange={event => updateProfile(field, event.target.value)}
+                          className="mt-1 block w-full rounded-md border border-[rgba(99,102,241,0.18)] bg-[#111520] px-3 py-2 text-sm normal-case text-[#d5d7e2] outline-none focus:ring-1 focus:ring-[#6366f1]"
+                        />
+                      ) : (
+                        <input
+                          value={textValue}
+                          onChange={event => updateProfile(field, event.target.value)}
+                          className="mt-1 block w-full rounded-md border border-[rgba(99,102,241,0.18)] bg-[#111520] px-3 py-2 text-sm normal-case text-[#d5d7e2] outline-none focus:ring-1 focus:ring-[#6366f1]"
+                        />
+                      )}
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold text-[#e2e4ef]">Generated agent configuration</h2>
+              <div className="mt-4 grid gap-4">
+                {([
+                  ["name", "Agent name"],
+                  ["description", "Description"],
+                  ["purpose", "Purpose"],
+                  ["goals", "Responsibilities"],
+                  ["tone", "Tone"],
+                  ["language", "Language"],
+                  ["systemInstructions", "Agent instructions"],
+                ] as const).map(([field, label]) => (
+                  <label key={field} className="text-xs text-[#a0a3b8]">
+                    {label}
+                    <textarea
+                      rows={field === "systemInstructions" || field === "goals" ? 4 : 2}
+                      value={form[field]}
+                      onChange={event => updateConfiguration(field, event.target.value)}
+                      className="mt-1 block w-full rounded-md border border-[rgba(99,102,241,0.18)] bg-[#111520] px-3 py-2 text-sm text-[#d5d7e2] outline-none focus:ring-1 focus:ring-[#6366f1]"
+                    />
+                  </label>
+                ))}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => void saveReview()}
+              disabled={saving}
+              className="rounded-md bg-[#7357e8] px-4 py-2 text-sm font-medium text-white hover:bg-[#6448d5] disabled:opacity-50"
+            >
+              {saving ? "Saving changes..." : "Save changes"}
+            </button>
+          </section>
+        ) : (
+          <TestStep form={form} agentId={agent.id} accessToken={accessToken} showConfiguredGreeting={false} />
+        )}
+      </div>
+    </main>
   );
 }
 
@@ -2025,6 +2324,7 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
   const [callActive, setCallActive] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [callDuration, setCallDuration] = useState(0);
+  const [callError, setCallError] = useState("");
   const [messages, setMessages] = useState<TestMessage[]>([]);
   const [processing, setProcessing] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -2147,8 +2447,9 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
 
   const startCall = () => {
     backendReadyRef.current = false;
+    setCallError("");
     setCallActive(true);
-    setMessages([{ id: "0", role: "agent", content: "Hello! Thanks for calling. How can I assist you today?", timestamp: new Date().toLocaleTimeString() }]);
+    setMessages([]);
     const audioContext = new AudioContext({ sampleRate: 16000 });
     audioContextRef.current = audioContext;
     voiceDiag("AudioContext created", { state: audioContext.state, sampleRate: audioContext.sampleRate });
@@ -2353,6 +2654,7 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
     };
     socket.onclose = event => {
       backendReadyRef.current = false;
+      if (event.reason) setCallError(event.reason);
       voiceDiag("frontend websocket onclose", {
         closeCode: event.code,
         reason: event.reason,
@@ -2644,6 +2946,8 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
           </div>
         </div>
 
+        {callError && <p role="alert" className="border-b border-[rgba(239,68,68,0.2)] bg-[rgba(239,68,68,0.08)] px-4 py-2 text-xs text-[#fca5a5]">{callError}</p>}
+
         {/* Transcript */}
         <div className="h-64 overflow-y-auto p-4 space-y-3" style={{ scrollbarWidth: "none" }}>
           {!callActive ? (
@@ -2736,6 +3040,7 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
 interface DashboardProps {
   agents: Agent[];
   onCreateAgent: () => void;
+  onPublishAgent: (agent: Agent) => void;
   onIntegrateAgent: (agent: Agent) => void;
   onEditAgent: (agent: Agent) => void;
   onUseAgent: (agent: Agent) => void;
@@ -2743,7 +3048,7 @@ interface DashboardProps {
   onDeleteAgent: (id: string) => void;
 }
 
-function Dashboard({ agents, onCreateAgent, onIntegrateAgent, onEditAgent, onUseAgent, onDuplicateAgent, onDeleteAgent }: DashboardProps) {
+function Dashboard({ agents, onCreateAgent, onPublishAgent, onIntegrateAgent, onEditAgent, onUseAgent, onDuplicateAgent, onDeleteAgent }: DashboardProps) {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<"all" | AgentStatus>("all");
   const [sortBy, setSortBy] = useState<"name" | "lastUpdated" | "totalCalls">("lastUpdated");
@@ -2914,6 +3219,14 @@ function Dashboard({ agents, onCreateAgent, onIntegrateAgent, onEditAgent, onUse
                           <Phone className="w-3 h-3" /> Use
                         </button>
                       )}
+                      {agent.status !== "published" && (
+                        <button
+                          onClick={() => onPublishAgent(agent)}
+                          className="flex items-center gap-1 px-2.5 py-1.5 bg-[rgba(99,102,241,0.1)] border border-[rgba(99,102,241,0.2)] text-[#a78bfa] text-xs rounded-lg hover:bg-[rgba(99,102,241,0.2)] transition-colors whitespace-nowrap"
+                        >
+                          <Zap className="w-3 h-3" /> Publish
+                        </button>
+                      )}
                       <button
                         onClick={() => onIntegrateAgent(agent)}
                         className="flex items-center gap-1 px-2.5 py-1.5 bg-[rgba(34,197,94,0.08)] border border-[rgba(34,197,94,0.2)] text-[#22c55e] text-xs rounded-lg hover:bg-[rgba(34,197,94,0.16)] transition-colors whitespace-nowrap"
@@ -3019,6 +3332,11 @@ export default function App() {
   const [, setProviderCatalogVersion] = useState(0);
   const [editingAgent, setEditingAgent] = useState<Agent | null>(null);
   const [onboardingDraft, setOnboardingDraft] = useState<{ sessionId: string; fields: AgentFields } | null>(null);
+  const [voiceAgentContext, setVoiceAgentContext] = useState<{
+    sessionId: string;
+    agent: Agent;
+    profile: BusinessProfile;
+  } | null>(null);
   const [useAgentTarget, setUseAgentTarget] = useState<Agent | null>(null);
   const [integrationTarget, setIntegrationTarget] = useState<Agent | null>(null);
 
@@ -3140,6 +3458,7 @@ if (!session) {
 
   const handleCreateVoiceAgent = () => {
     setCreateModeOpen(false);
+    setVoiceAgentContext(null);
     setView("voice-onboarding");
   };
 
@@ -3180,27 +3499,35 @@ if (!session) {
     }
   };
 
-  const handleOnboardingDraft = async (
+  const handlePublishAgent = async (agent: Agent) => {
+    if (!window.confirm("Approve this configuration and publish it now?")) return;
+    try {
+      const publishedAgent = await handleSaveAgent(
+        { ...formFromAgent(agent), status: "published" },
+        undefined,
+        agent.id,
+      );
+      if (publishedAgent.status !== "published") {
+        throw new Error("The backend did not confirm that this agent was published.");
+      }
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Agent could not be published. Please retry.");
+    }
+  };
+
+  const handleOnboardingAgent = async (
     sessionId: string,
     fields: AgentFields,
+    profile: BusinessProfile,
     associatedAgentId?: string | null,
-  ) => {
-    const initialForm: AgentForm = {
-      ...defaultForm,
-      name: fields.name || defaultForm.name,
-      description: fields.description || defaultForm.description,
-      purpose: fields.purpose || defaultForm.purpose,
-      businessContext: fields.businessContext || defaultForm.businessContext,
-      goals: fields.goals || defaultForm.goals,
-      tone: fields.tone || defaultForm.tone,
-      language: fields.language || defaultForm.language,
-      status: "draft",
-    };
+  ): Promise<{ id: string }> => {
+    const initialForm = voiceAgentForm(fields);
     let agent;
     if (associatedAgentId) {
       const existing = await apiRequest(`/api/v1/agents/${associatedAgentId}`, {
         accessToken: session.access_token,
       });
+      const existingAgent = mapAgent(existing);
       const existingForm = { ...defaultForm };
       for (const field of Object.keys(defaultForm) as (keyof AgentForm)[]) {
         if (existing[field] !== undefined) {
@@ -3211,19 +3538,73 @@ if (!session) {
         ...existingForm,
         name: initialForm.name,
         description: initialForm.description,
+        llmProvider: initialForm.llmProvider,
+        llmModel: initialForm.llmModel,
         purpose: initialForm.purpose,
         businessContext: initialForm.businessContext,
         goals: initialForm.goals,
         tone: initialForm.tone,
         language: initialForm.language,
-        status: "draft",
+        systemInstructions: initialForm.systemInstructions,
+        status: existingAgent.status,
       }, undefined, associatedAgentId);
     } else {
       agent = await handleSaveAgent(initialForm, sessionId);
     }
-    setOnboardingDraft({ sessionId, fields });
-    setEditingAgent(agent);
-    setView("wizard");
+    setVoiceAgentContext({ sessionId, agent, profile });
+    setView("voice-test");
+    return { id: agent.id };
+  };
+
+  const handleSaveVoiceReview = async (
+    sessionId: string,
+    agent: Agent,
+    form: AgentForm,
+    profile: BusinessProfile,
+  ): Promise<{ agent: Agent; profile: BusinessProfile }> => {
+    const profileValues = Object.fromEntries(
+      editableProfileFields.map(field => [field, profile[field]]),
+    );
+    const reviewed = await apiRequest(
+      `/api/v1/onboarding/sessions/${sessionId}/profile`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(profileValues),
+        accessToken: session.access_token,
+      },
+    );
+    const previousConfiguration = agent as Agent & Partial<AgentForm>;
+    const generatedForm = voiceAgentForm(reviewed.agent_fields);
+    const updatedForm: AgentForm = {
+      ...form,
+      name: form.name === agent.name && reviewed.agent_fields.name
+        ? reviewed.agent_fields.name
+        : form.name,
+      description: form.description === agent.description
+        ? reviewed.agent_fields.description
+        : form.description,
+      purpose: form.purpose === previousConfiguration.purpose
+        ? reviewed.agent_fields.purpose
+        : form.purpose,
+      goals: form.goals === previousConfiguration.goals
+        ? reviewed.agent_fields.goals
+        : form.goals,
+      tone: form.tone === previousConfiguration.tone
+        ? reviewed.agent_fields.tone
+        : form.tone,
+      language: form.language === previousConfiguration.language
+        ? reviewed.agent_fields.language
+        : form.language,
+      businessContext: reviewed.agent_fields.businessContext,
+      systemInstructions: form.systemInstructions === previousConfiguration.systemInstructions
+        ? generatedForm.systemInstructions
+        : form.systemInstructions,
+    };
+    const savedAgent = await handleSaveAgent(updatedForm, undefined, agent.id);
+    setVoiceAgentContext(current => current
+      ? { ...current, agent: savedAgent, profile: reviewed.profile }
+      : current);
+    return { agent: savedAgent, profile: reviewed.profile };
   };
 
   const handleDuplicateAgent = async (agent: Agent) => {
@@ -3362,6 +3743,7 @@ if (!session) {
         <Dashboard
           agents={agents}
           onCreateAgent={handleCreateAgent}
+          onPublishAgent={handlePublishAgent}
           onIntegrateAgent={setIntegrationTarget}
           onEditAgent={handleEditAgent}
           onUseAgent={setUseAgentTarget}
@@ -3370,7 +3752,19 @@ if (!session) {
         />
       )}
 
-      {view === "voice-onboarding" && <VoiceOnboarding onCreateDraft={handleOnboardingDraft} />}
+      {view === "voice-onboarding" && <VoiceOnboarding onCreateAgent={handleOnboardingAgent} />}
+
+      {view === "voice-test" && voiceAgentContext && (
+        <VoiceAgentWorkspace
+          key={voiceAgentContext.agent.id}
+          sessionId={voiceAgentContext.sessionId}
+          agent={voiceAgentContext.agent}
+          profile={voiceAgentContext.profile}
+          accessToken={session.access_token}
+          onBack={() => setView("dashboard")}
+          onSave={handleSaveVoiceReview}
+        />
+      )}
 
       {view === "wizard" && (
         <AgentWizard
