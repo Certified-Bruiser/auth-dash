@@ -446,7 +446,7 @@ const defaultForm: AgentForm = {
 
 function voiceAgentForm(fields: AgentFields): AgentForm {
   const identity = fields.name || "Business Assistant";
-  const instructions = [
+  const defaultInstructions = [
     `You are the customer-facing assistant for ${identity}.`,
     fields.purpose ? `Your purpose is: ${fields.purpose}.` : "",
     fields.goals ? `Your responsibilities are:\n${fields.goals}` : "",
@@ -467,7 +467,11 @@ function voiceAgentForm(fields: AgentFields): AgentForm {
     goals: fields.goals,
     tone: fields.tone || defaultForm.tone,
     language: fields.language || defaultForm.language,
-    systemInstructions: instructions,
+    systemInstructions: fields.systemInstructions || defaultInstructions,
+    allowedTopics: fields.allowedTopics || defaultForm.allowedTopics,
+    restrictedTopics: fields.restrictedTopics || defaultForm.restrictedTopics,
+    escalationRules: fields.escalationRules || defaultForm.escalationRules,
+    humanHandoffConditions: fields.humanHandoffConditions || defaultForm.humanHandoffConditions,
     status: "draft",
   };
 }
@@ -3521,34 +3525,21 @@ if (!session) {
     profile: BusinessProfile,
     associatedAgentId?: string | null,
   ): Promise<{ id: string }> => {
-    const initialForm = voiceAgentForm(fields);
     let agent;
     if (associatedAgentId) {
       const existing = await apiRequest(`/api/v1/agents/${associatedAgentId}`, {
         accessToken: session.access_token,
       });
       const existingAgent = mapAgent(existing);
-      const existingForm = { ...defaultForm };
-      for (const field of Object.keys(defaultForm) as (keyof AgentForm)[]) {
-        if (existing[field] !== undefined) {
-          (existingForm as Record<keyof AgentForm, AgentForm[keyof AgentForm]>)[field] = existing[field];
-        }
-      }
+      const existingForm = formFromAgent(existingAgent);
       agent = await handleSaveAgent({
         ...existingForm,
-        name: initialForm.name,
-        description: initialForm.description,
-        llmProvider: initialForm.llmProvider,
-        llmModel: initialForm.llmModel,
-        purpose: initialForm.purpose,
-        businessContext: initialForm.businessContext,
-        goals: initialForm.goals,
-        tone: initialForm.tone,
-        language: initialForm.language,
-        systemInstructions: initialForm.systemInstructions,
-        status: existingAgent.status,
+        name: fields.name || existingForm.name,
+        description: fields.description || existingForm.description,
+        businessContext: fields.businessContext || existingForm.businessContext,
       }, undefined, associatedAgentId);
     } else {
+      const initialForm = voiceAgentForm(fields);
       agent = await handleSaveAgent(initialForm, sessionId);
     }
     setVoiceAgentContext({ sessionId, agent, profile });
@@ -3574,7 +3565,6 @@ if (!session) {
       },
     );
     const previousConfiguration = agent as Agent & Partial<AgentForm>;
-    const generatedForm = voiceAgentForm(reviewed.agent_fields);
     const updatedForm: AgentForm = {
       ...form,
       name: form.name === agent.name && reviewed.agent_fields.name
@@ -3583,22 +3573,12 @@ if (!session) {
       description: form.description === agent.description
         ? reviewed.agent_fields.description
         : form.description,
-      purpose: form.purpose === previousConfiguration.purpose
-        ? reviewed.agent_fields.purpose
-        : form.purpose,
-      goals: form.goals === previousConfiguration.goals
-        ? reviewed.agent_fields.goals
-        : form.goals,
-      tone: form.tone === previousConfiguration.tone
-        ? reviewed.agent_fields.tone
-        : form.tone,
-      language: form.language === previousConfiguration.language
-        ? reviewed.agent_fields.language
-        : form.language,
+      purpose: form.purpose,
+      goals: form.goals,
+      tone: form.tone,
+      language: form.language,
       businessContext: reviewed.agent_fields.businessContext,
-      systemInstructions: form.systemInstructions === previousConfiguration.systemInstructions
-        ? generatedForm.systemInstructions
-        : form.systemInstructions,
+      systemInstructions: form.systemInstructions,
     };
     const savedAgent = await handleSaveAgent(updatedForm, undefined, agent.id);
     setVoiceAgentContext(current => current
@@ -3752,7 +3732,9 @@ if (!session) {
         />
       )}
 
-      {view === "voice-onboarding" && <VoiceOnboarding onCreateAgent={handleOnboardingAgent} />}
+      <div className={view === "voice-onboarding" ? "" : "hidden"} aria-hidden={view !== "voice-onboarding"}>
+        <VoiceOnboarding active={view === "voice-onboarding"} onCreateAgent={handleOnboardingAgent} />
+      </div>
 
       {view === "voice-test" && voiceAgentContext && (
         <VoiceAgentWorkspace

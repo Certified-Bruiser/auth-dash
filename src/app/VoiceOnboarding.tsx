@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { AlertCircle, AudioLines, Mic, MicOff, PhoneOff, Volume2 } from "lucide-react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import { AlertCircle, AudioLines, Mic, MicOff, Paperclip, PhoneOff, Send, Volume2 } from "lucide-react";
 import { supabase } from "../lib/supabase";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
@@ -31,6 +31,11 @@ export interface AgentFields {
   tone: string;
   language: string;
   businessContext: string;
+  systemInstructions?: string;
+  allowedTopics?: string[];
+  restrictedTopics?: string[];
+  escalationRules?: string;
+  humanHandoffConditions?: string;
 }
 
 interface OnboardingSessionSummary {
@@ -46,6 +51,7 @@ type TranscriptTurn = string | { role: "user" | "assistant"; content: string };
 type ConversationMessage = { role: "user" | "assistant"; content: string };
 
 interface VoiceOnboardingProps {
+  active?: boolean;
   onCreateAgent: (
     sessionId: string,
     fields: AgentFields,
@@ -113,7 +119,7 @@ function getRecognitionConstructor(): SpeechRecognitionConstructor | null {
   return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null;
 }
 
-export default function VoiceOnboarding({ onCreateAgent }: VoiceOnboardingProps) {
+export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceOnboardingProps) {
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isEnded, setIsEnded] = useState(false);
@@ -122,6 +128,7 @@ export default function VoiceOnboarding({ onCreateAgent }: VoiceOnboardingProps)
   const [consented, setConsented] = useState(false);
   const [sessionId, setSessionId] = useState("");
   const [transcript, setTranscript] = useState("");
+  const [textMessage, setTextMessage] = useState("");
   const [conversationMessages, setConversationMessages] = useState<ConversationMessage[]>([]);
   const [assistantReply, setAssistantReply] = useState("");
   const [profile, setProfile] = useState<BusinessProfile | null>(null);
@@ -136,10 +143,10 @@ export default function VoiceOnboarding({ onCreateAgent }: VoiceOnboardingProps)
   const conversationRef = useRef<HTMLDivElement | null>(null);
   const researchPollInFlightRef = useRef(false);
   const transcriptRef = useRef("");
-  const lastSubmittedTurnRef = useRef("");
-  const turnQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const turnInFlightRef = useRef(false);
   const recognitionErrorRef = useRef(false);
   const endedRef = useRef(false);
+  const activeRef = useRef(active);
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const Recognition = getRecognitionConstructor();
   const speechOutputAvailable = typeof window !== "undefined" && "speechSynthesis" in window;
@@ -211,7 +218,6 @@ export default function VoiceOnboarding({ onCreateAgent }: VoiceOnboardingProps)
       ]);
       setTranscript("");
       transcriptRef.current = "";
-      lastSubmittedTurnRef.current = "";
       setResearch([]);
       setAssociatedAgentId(null);
       setProfileDirty(false);
@@ -248,7 +254,6 @@ export default function VoiceOnboarding({ onCreateAgent }: VoiceOnboardingProps)
       transcriptRef.current = "";
       setConversationMessages(savedMessages);
       setAssistantReply(latestAssistantReply);
-      lastSubmittedTurnRef.current = "";
       setResearch(data.research || []);
       setAssociatedAgentId(data.agent_id || null);
       setProfileDirty(false);
@@ -289,7 +294,13 @@ export default function VoiceOnboarding({ onCreateAgent }: VoiceOnboardingProps)
       setProfile(reviewed.profile);
       setCompletionRecorded(Boolean(reviewed.completion_recorded));
       setProfileDirty(false);
-      const agent = await onCreateAgent(sessionId, reviewed.agent_fields, reviewed.profile, associatedAgentId);
+      const fields = associatedAgentId
+        ? reviewed.agent_fields
+        : {
+          ...reviewed.agent_fields,
+          ...await onboardingRequest(`/sessions/${sessionId}/agent-fields`, { method: "POST" }),
+        };
+      const agent = await onCreateAgent(sessionId, fields, reviewed.profile, associatedAgentId);
       setAssociatedAgentId(agent.id);
       setSavedSessions(current => current.map(item =>
         item.id === sessionId ? { ...item, agent_id: agent.id } : item,
@@ -303,8 +314,12 @@ export default function VoiceOnboarding({ onCreateAgent }: VoiceOnboardingProps)
 
   const submitTurn = async (text: string) => {
     const normalizedText = text.trim();
-    if (!sessionId || endedRef.current || !normalizedText || lastSubmittedTurnRef.current === normalizedText) return;
-    lastSubmittedTurnRef.current = normalizedText;
+    if (!sessionId || endedRef.current || !normalizedText || turnInFlightRef.current) return;
+    turnInFlightRef.current = true;
+    setConversationMessages(current => [...current, { role: "user", content: normalizedText }]);
+    setTranscript("");
+    transcriptRef.current = "";
+    setTextMessage("");
     setAssistantReply("");
     setIsProcessing(true);
     try {
@@ -316,12 +331,9 @@ export default function VoiceOnboarding({ onCreateAgent }: VoiceOnboardingProps)
       setCompletionRecorded(Boolean(data.completion_recorded));
       setResearch(data.research || []);
       const assistantMessage = typeof data.assistant_reply === "string" ? data.assistant_reply.trim() : "";
-      setConversationMessages(current => [
-        ...current,
-        { role: "user", content: normalizedText },
-        ...(assistantMessage ? [{ role: "assistant" as const, content: assistantMessage }] : []),
-      ]);
-      setTranscript(current => current.trim() === normalizedText ? "" : current);
+      if (assistantMessage) {
+        setConversationMessages(current => [...current, { role: "assistant", content: assistantMessage }]);
+      }
       if (typeof data.assistant_reply === "string" && data.assistant_reply.trim()) {
         setAssistantReply(data.assistant_reply);
         speakText(data.assistant_reply);
@@ -330,11 +342,16 @@ export default function VoiceOnboarding({ onCreateAgent }: VoiceOnboardingProps)
         setVoiceMessage("Your answer was saved, but no reply was returned. You can continue or resume this session later.");
       }
     } catch (error) {
-      lastSubmittedTurnRef.current = "";
       setVoiceMessage(error instanceof Error ? error.message : "This turn could not be processed.");
     } finally {
+      turnInFlightRef.current = false;
       setIsProcessing(false);
     }
+  };
+
+  const submitTextMessage = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    void submitTurn(textMessage);
   };
 
   useEffect(() => {
@@ -343,6 +360,18 @@ export default function VoiceOnboarding({ onCreateAgent }: VoiceOnboardingProps)
       window.speechSynthesis?.cancel();
     };
   }, []);
+
+  useEffect(() => {
+    activeRef.current = active;
+    if (active) return;
+    recognitionRef.current?.abort();
+    recognitionRef.current = null;
+    transcriptRef.current = "";
+    setTranscript("");
+    setIsListening(false);
+    window.speechSynthesis?.cancel();
+    setIsSpeaking(false);
+  }, [active]);
 
   useEffect(() => {
     const conversation = conversationRef.current;
@@ -426,14 +455,12 @@ export default function VoiceOnboarding({ onCreateAgent }: VoiceOnboardingProps)
     recognition.onend = () => {
       recognitionRef.current = null;
       setIsListening(false);
-      if (endedRef.current) return;
+      if (endedRef.current || !activeRef.current) return;
       if (transcriptRef.current) {
         setTranscript(transcriptRef.current);
         setVoiceMessage("Processing your latest turn...");
         const turn = transcriptRef.current;
-        turnQueueRef.current = turnQueueRef.current
-          .then(() => submitTurn(turn))
-          .catch(() => undefined);
+        void submitTurn(turn);
       } else if (!recognitionErrorRef.current) {
         setVoiceMessage("No speech was captured. Try again when you're ready.");
       }
@@ -515,6 +542,54 @@ export default function VoiceOnboarding({ onCreateAgent }: VoiceOnboardingProps)
 
                 {isProcessing && <p className="text-xs text-[#a0a3b8]" role="status">Updating profile...</p>}
               </div>
+            )}
+
+            {consented && (
+              <form onSubmit={submitTextMessage} className="flex items-end gap-2 rounded-lg border border-[rgba(99,102,241,0.2)] bg-[#111520] p-2">
+                <button
+                  type="button"
+                  disabled
+                  aria-label="Attachments unavailable"
+                  title="Attachments unavailable"
+                  className="mb-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[#71748a] disabled:cursor-not-allowed"
+                >
+                  <Paperclip className="h-5 w-5" aria-hidden="true" />
+                </button>
+                <textarea
+                  rows={2}
+                  value={textMessage}
+                  onChange={event => setTextMessage(event.target.value)}
+                  onKeyDown={event => {
+                    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                      event.preventDefault();
+                      event.currentTarget.form?.requestSubmit();
+                    }
+                  }}
+                  disabled={!sessionId || isEnded || isProcessing || isListening}
+                  placeholder="Type a message"
+                  aria-label="Type a message"
+                  className="max-h-32 min-h-10 min-w-0 flex-1 resize-y bg-transparent px-2 py-2 text-sm leading-5 text-[#e2e4ef] outline-none placeholder:text-[#71748a] disabled:cursor-not-allowed disabled:opacity-50"
+                />
+                <button
+                  type="button"
+                  onClick={isListening ? () => recognitionRef.current?.stop() : startListening}
+                  disabled={!Recognition || isEnded || !sessionId || isProcessing}
+                  aria-label={isListening ? "Stop listening" : "Start speaking"}
+                  title={isListening ? "Stop listening" : "Start speaking"}
+                  className={`mb-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${isListening ? "bg-[rgba(248,113,113,0.14)] text-[#f87171]" : "bg-[#171d2e] text-[#b4b8cc] hover:text-white"}`}
+                >
+                  {isListening ? <MicOff className="h-5 w-5" aria-hidden="true" /> : <Mic className="h-5 w-5" aria-hidden="true" />}
+                </button>
+                <button
+                  type="submit"
+                  disabled={!sessionId || isEnded || isProcessing || !textMessage.trim()}
+                  aria-label="Send message"
+                  title="Send message"
+                  className="mb-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[#7357e8] text-white transition-colors hover:bg-[#6448d5] disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <Send className="h-4 w-4" aria-hidden="true" />
+                </button>
+              </form>
             )}
 
             {!consented ? (
@@ -610,7 +685,7 @@ export default function VoiceOnboarding({ onCreateAgent }: VoiceOnboardingProps)
             <div className="flex flex-col items-center gap-4 border-t border-[rgba(99,102,241,0.12)] pt-5">
               <p aria-live="polite" className="min-h-5 text-center text-sm text-[#a0a3b8]">
                 {voiceMessage || (!Recognition
-                  ? "Speech recognition is not supported in this browser."
+                  ? "Speech recognition is not supported here. You can type instead."
                   : !consented
                     ? "Review consent to begin."
                     : "Speak naturally; your profile updates as you share details.")}
@@ -625,16 +700,6 @@ export default function VoiceOnboarding({ onCreateAgent }: VoiceOnboardingProps)
                   className="flex h-11 w-11 items-center justify-center rounded-full border border-[rgba(99,102,241,0.22)] bg-[#171d2e] text-[#b4b8cc] transition-colors hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   <Volume2 className="h-4 w-4" aria-hidden="true" />
-                </button>
-                <button
-                  type="button"
-                  onClick={isListening ? () => recognitionRef.current?.stop() : startListening}
-                  disabled={!Recognition || isEnded || !consented || !sessionId}
-                  aria-label={isListening ? "Stop listening" : "Start listening"}
-                  title={isListening ? "Stop listening" : "Start listening"}
-                  className={`flex h-16 w-16 items-center justify-center rounded-full border transition-colors focus:outline-none focus:ring-2 focus:ring-[#a78bfa] disabled:cursor-not-allowed disabled:opacity-40 ${isListening ? "border-[#f87171] bg-[rgba(248,113,113,0.14)] text-[#f87171]" : "border-[rgba(139,107,255,0.5)] bg-[#7357e8] text-white hover:bg-[#6448d5]"}`}
-                >
-                  {isListening ? <MicOff className="h-6 w-6" aria-hidden="true" /> : <Mic className="h-6 w-6" aria-hidden="true" />}
                 </button>
                 <button
                   type="button"
