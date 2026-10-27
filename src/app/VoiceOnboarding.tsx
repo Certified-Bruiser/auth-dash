@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { AlertCircle, AudioLines, Mic, MicOff, Paperclip, PhoneOff, Send, Volume2 } from "lucide-react";
+import { Mic, MicOff, Paperclip, PhoneOff, Send, Volume2 } from "lucide-react";
 import { supabase } from "../lib/supabase";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
@@ -120,6 +120,7 @@ function getRecognitionConstructor(): SpeechRecognitionConstructor | null {
 }
 
 export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceOnboardingProps) {
+  const [mode, setMode] = useState<"chat" | "voice">("voice");
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isEnded, setIsEnded] = useState(false);
@@ -134,7 +135,7 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
   const [profile, setProfile] = useState<BusinessProfile | null>(null);
   const [completionRecorded, setCompletionRecorded] = useState(false);
   const [research, setResearch] = useState<ResearchJob[]>([]);
-  const [savedSessions, setSavedSessions] = useState<OnboardingSessionSummary[]>([]);
+  const [, setSavedSessions] = useState<OnboardingSessionSummary[]>([]);
   const [associatedAgentId, setAssociatedAgentId] = useState<string | null>(null);
   const [isSavingReview, setIsSavingReview] = useState(false);
   const [profileDirty, setProfileDirty] = useState(false);
@@ -148,10 +149,25 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
   const endedRef = useRef(false);
   const activeRef = useRef(active);
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const modeRef = useRef<"chat" | "voice">("voice");
+  const modeEpochRef = useRef(0);
   const Recognition = getRecognitionConstructor();
   const speechOutputAvailable = typeof window !== "undefined" && "speechSynthesis" in window;
 
+  const switchMode = (nextMode: "chat" | "voice") => {
+    if (modeRef.current === nextMode) return;
+    modeRef.current = nextMode;
+    modeEpochRef.current += 1;
+    setMode(nextMode);
+    if (nextMode === "chat") {
+      window.speechSynthesis?.cancel();
+      utteranceRef.current = null;
+      setIsSpeaking(false);
+    }
+  };
+
   const speakText = (text: string) => {
+    if (modeRef.current !== "voice" || endedRef.current || !activeRef.current) return;
     if (!speechOutputAvailable || isEnded) {
       setVoiceMessage("Speech playback is unavailable in this browser.");
       return;
@@ -159,15 +175,23 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
 
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
-    utterance.onstart = () => setIsSpeaking(true);
+    utterance.onstart = () => {
+      if (utteranceRef.current === utterance && modeRef.current === "voice") setIsSpeaking(true);
+    };
     utterance.onend = () => {
-      setIsSpeaking(false);
-      utteranceRef.current = null;
+      if (utteranceRef.current === utterance) {
+        setIsSpeaking(false);
+        utteranceRef.current = null;
+      }
     };
     utterance.onerror = () => {
-      setIsSpeaking(false);
-      utteranceRef.current = null;
-      setVoiceMessage("The greeting could not be played. Use the replay control to try again.");
+      if (utteranceRef.current === utterance) {
+        setIsSpeaking(false);
+        utteranceRef.current = null;
+        if (modeRef.current === "voice") {
+          setVoiceMessage("The greeting could not be played. Use the replay control to try again.");
+        }
+      }
     };
     utteranceRef.current = utterance;
     window.speechSynthesis.speak(utterance);
@@ -204,7 +228,7 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
         : greeting;
       setConversationMessages([{ role: "assistant", content: firstReply }]);
       setAssistantReply(firstReply);
-      speakText(firstReply);
+      if (modeRef.current === "voice") speakText(firstReply);
       setCompletionRecorded(false);
       setSavedSessions(current => [
         {
@@ -315,6 +339,8 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
   const submitTurn = async (text: string) => {
     const normalizedText = text.trim();
     if (!sessionId || endedRef.current || !normalizedText || turnInFlightRef.current) return;
+    const submittedMode = modeRef.current;
+    const submittedModeEpoch = modeEpochRef.current;
     turnInFlightRef.current = true;
     setConversationMessages(current => [...current, { role: "user", content: normalizedText }]);
     setTranscript("");
@@ -336,7 +362,15 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
       }
       if (typeof data.assistant_reply === "string" && data.assistant_reply.trim()) {
         setAssistantReply(data.assistant_reply);
-        speakText(data.assistant_reply);
+        if (
+          submittedMode === "voice"
+          && modeRef.current === "voice"
+          && modeEpochRef.current === submittedModeEpoch
+          && !endedRef.current
+          && activeRef.current
+        ) {
+          speakText(data.assistant_reply);
+        }
         setVoiceMessage("Your profile is updated.");
       } else {
         setVoiceMessage("Your answer was saved, but no reply was returned. You can continue or resume this session later.");
@@ -489,74 +523,99 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
   };
 
   return (
-    <main className="min-h-[calc(100vh-3.5rem)] px-4 py-8 sm:px-6 sm:py-12" style={{ fontFamily: "DM Sans, sans-serif" }}>
-      <div className="mx-auto max-w-3xl">
-        <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-wider text-[#a78bfa]">Voice Mode</p>
-            <h1 className="mt-1 text-2xl font-semibold text-[#e2e4ef] sm:text-3xl" style={{ fontFamily: "Outfit, sans-serif" }}>
-              Let's understand your business
-            </h1>
-          </div>
-          <div className="flex items-center gap-2 text-xs text-[#a0a3b8]" role="status">
-            {isStarting || isProcessing ? <span className="h-2 w-2 animate-pulse rounded-full bg-[#f0ad79]" /> : <AlertCircle className="h-4 w-4" aria-hidden="true" />}
-            {isStarting ? "Starting" : isProcessing ? "Updating profile" : sessionId ? "Onboarding active" : "Consent required"}
-          </div>
-        </div>
-
-        <section className="overflow-hidden rounded-xl border border-[rgba(99,102,241,0.18)] bg-[#0d1018]">
-          <div className="flex items-center justify-between border-b border-[rgba(99,102,241,0.12)] px-5 py-3">
-            <div className="flex items-center gap-2 text-sm font-medium text-[#c5c7d5]">
-              <AudioLines className="h-4 w-4 text-[#a78bfa]" aria-hidden="true" /> Voice session
-            </div>
-            <div className="flex min-h-5 items-center gap-2 text-xs text-[#a0a3b8]" aria-live="polite">
-              {isListening && <><span className="h-2 w-2 animate-pulse rounded-full bg-[#f87171]" /> Listening</>}
-              {isSpeaking && <><span className="h-2 w-2 animate-pulse rounded-full bg-[#38bdf8]" /> Speaking</>}
-              {!isListening && !isSpeaking && (isEnded ? "Ended" : isProcessing ? "Processing" : "Ready")}
+    <main className="min-h-[calc(100vh-3.5rem)] bg-background px-0 py-0 text-foreground sm:px-5 sm:py-5" style={{ fontFamily: "DM Sans, sans-serif" }}>
+      <section className="mx-auto flex min-h-[calc(100vh-3.5rem)] w-full max-w-5xl flex-col overflow-hidden bg-card shadow-sm sm:min-h-[calc(100vh-6rem)] sm:rounded-xl sm:border sm:border-border">
+        <header className="flex shrink-0 items-center justify-between gap-3 border-b border-[#1e3a8a] bg-[#172554] px-4 py-3 text-white sm:px-6">
+          <div className="flex min-w-0 items-center gap-3">
+            <img src="/favicon.svg" alt="VoxAgent" className="h-11 w-11 shrink-0 rounded-full bg-white object-contain" />
+            <div className="min-w-0">
+              <h1 className="truncate text-base font-semibold text-white sm:text-lg" style={{ fontFamily: "Outfit, sans-serif" }}>
+                VoxAgent
+              </h1>
+              <p className="text-xs text-blue-100/80">{isStarting ? "Starting your conversation" : sessionId ? "Your business assistant" : "Get your business agent ready"}</p>
             </div>
           </div>
+          <div className="flex shrink-0 items-center gap-2 sm:gap-4">
+            <div className="relative grid h-9 grid-cols-2 rounded-full bg-[#1e3a8a] p-1 text-xs" role="group" aria-label="Conversation mode">
+              <span className={`absolute inset-y-1 left-1 w-[calc(50%-0.25rem)] rounded-full bg-[#1d4ed8] shadow-sm transition-transform duration-200 ${mode === "voice" ? "translate-x-full" : "translate-x-0"}`} aria-hidden="true" />
+              <button
+                type="button"
+                onClick={() => switchMode("chat")}
+                aria-pressed={mode === "chat"}
+                className={`relative z-10 min-w-[4.25rem] rounded-full px-3 font-medium transition-colors ${mode === "chat" ? "text-white" : "text-blue-100"}`}
+              >
+                Chat
+              </button>
+              <button
+                type="button"
+                onClick={() => switchMode("voice")}
+                aria-pressed={mode === "voice"}
+                className={`relative z-10 min-w-[4.25rem] rounded-full px-3 font-medium transition-colors ${mode === "voice" ? "text-white" : "text-blue-100"}`}
+              >
+                Voice
+              </button>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-blue-100" role="status">
+              {isStarting || isProcessing ? <span className="h-2 w-2 animate-pulse rounded-full bg-chart-5" /> : <span className={`h-2 w-2 rounded-full ${sessionId && !isEnded ? "bg-blue-300" : "bg-blue-100/50"}`} />}
+              <span className="hidden text-[11px] sm:inline sm:text-xs">{isStarting ? "Starting" : isProcessing ? "Updating" : isListening ? "Listening" : isSpeaking ? "Speaking" : isEnded ? "Ended" : sessionId ? "Active" : "Not connected"}</span>
+            </div>
+          </div>
+        </header>
 
-          <div className="space-y-5 p-5 sm:p-8">
-            {consented && (
-              <div ref={conversationRef} className="max-h-[min(50vh,30rem)] space-y-4 overflow-y-auto pr-1" aria-live="polite" aria-label="Conversation">
-                {conversationMessages.map((message, index) => (
+        <div className="flex min-h-0 flex-1 flex-col">
+          {consented && (
+            <div
+              ref={conversationRef}
+              className="min-h-[18rem] flex-1 space-y-3 overflow-y-auto bg-[#efeae2] px-3 py-5 sm:px-7 sm:py-7"
+              aria-live="polite"
+              aria-label="Conversation"
+            >
+              {conversationMessages.map((message, index) => (
+                <div key={`${index}-${message.role}`} className={`flex items-start gap-2 ${message.role === "user" ? "justify-end" : "justify-start"}`}>
+                  {message.role === "assistant" && <img src="/favicon.svg" alt="" className="mt-1 h-7 w-7 shrink-0 rounded-full bg-card object-contain" />}
                   <div
-                    key={`${index}-${message.role}`}
-                    className={`w-fit max-w-[90%] rounded-lg border p-4 sm:max-w-2xl sm:p-5 ${message.role === "user"
-                      ? "ml-auto border-[rgba(56,189,248,0.18)] bg-[rgba(56,189,248,0.06)]"
-                      : "mr-auto border-[rgba(99,102,241,0.14)] bg-[#111520]"}`}
+                    className={`w-fit max-w-[88%] rounded-xl border px-3.5 py-2.5 shadow-sm sm:max-w-[75%] sm:px-4 ${message.role === "user"
+                      ? "rounded-tr-sm border-[#bfdbfe] bg-[#dbeafe] text-[#172554]"
+                      : "rounded-tl-sm border-white bg-white text-[#172554]"}`}
                   >
-                    <p className={`mb-2 text-xs font-medium uppercase tracking-wider ${message.role === "user" ? "text-[#7dd3fc]" : "text-[#a78bfa]"}`}>
-                      {message.role === "user" ? "You" : "Assistant"}
+                    <p className="whitespace-pre-wrap break-words text-sm leading-6">{message.content}</p>
+                    <p className="mt-1 text-right text-[10px] text-slate-600">
+                      {message.role === "user" ? "You" : "VoxAgent"}
                     </p>
-                    <p className="whitespace-pre-wrap text-sm leading-6 text-[#e2e4ef]">{message.content}</p>
                   </div>
-                ))}
+                </div>
+              ))}
 
-                {transcript && (
-                  <div className="ml-auto w-fit max-w-[90%] rounded-lg border border-[rgba(56,189,248,0.18)] bg-[rgba(56,189,248,0.06)] p-4 sm:max-w-2xl sm:p-5">
-                    <p className="mb-2 text-xs font-medium uppercase tracking-wider text-[#7dd3fc]">You</p>
-                    <p className="whitespace-pre-wrap text-sm leading-6 text-[#c5c7d5]">{transcript}</p>
-                  </div>
-                )}
+              {transcript && (
+                <div className="ml-auto w-fit max-w-[88%] rounded-xl rounded-tr-sm border border-[#bfdbfe] bg-[#dbeafe] px-3.5 py-2.5 opacity-80 shadow-sm sm:max-w-[75%] sm:px-4">
+                  <p className="whitespace-pre-wrap break-words text-sm leading-6 text-[#172554]">{transcript}</p>
+                  <p className="mt-1 text-right text-[10px] text-slate-600">Listening</p>
+                </div>
+              )}
 
-                {isProcessing && <p className="text-xs text-[#a0a3b8]" role="status">Updating profile...</p>}
-              </div>
-            )}
+              {isProcessing && (
+                <div className="mr-auto w-fit rounded-xl rounded-tl-sm border border-white bg-white px-4 py-3 text-xs text-slate-600 shadow-sm" role="status">
+                  Updating your profile...
+                </div>
+              )}
+            </div>
+          )}
 
-            {consented && (
-              <form onSubmit={submitTextMessage} className="flex items-end gap-2 rounded-lg border border-[rgba(99,102,241,0.2)] bg-[#111520] p-2">
+          {consented && (
+            <div className="shrink-0 border-t border-[#d6d3d1] bg-[#f8fafc] px-3 py-3 sm:px-5">
+              <form onSubmit={submitTextMessage} className="flex items-end gap-1.5 sm:gap-2">
+                <div className="flex min-h-12 min-w-0 flex-1 items-end gap-1 rounded-3xl bg-white px-2 shadow-sm ring-1 ring-[#cbd5e1] sm:px-3">
                 <button
                   type="button"
                   disabled
                   aria-label="Attachments unavailable"
                   title="Attachments unavailable"
-                  className="mb-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[#71748a] disabled:cursor-not-allowed"
+                  className="mb-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[#64748b] disabled:cursor-not-allowed"
                 >
                   <Paperclip className="h-5 w-5" aria-hidden="true" />
                 </button>
                 <textarea
-                  rows={2}
+                  rows={1}
                   value={textMessage}
                   onChange={event => setTextMessage(event.target.value)}
                   onKeyDown={event => {
@@ -568,15 +627,16 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
                   disabled={!sessionId || isEnded || isProcessing || isListening}
                   placeholder="Type a message"
                   aria-label="Type a message"
-                  className="max-h-32 min-h-10 min-w-0 flex-1 resize-y bg-transparent px-2 py-2 text-sm leading-5 text-[#e2e4ef] outline-none placeholder:text-[#71748a] disabled:cursor-not-allowed disabled:opacity-50"
+                  className="max-h-32 min-h-12 min-w-0 flex-1 resize-y bg-transparent px-2 py-3 text-sm leading-5 text-[#172554] outline-none placeholder:text-[#64748b] disabled:cursor-not-allowed disabled:opacity-50"
                 />
+                </div>
                 <button
                   type="button"
                   onClick={isListening ? () => recognitionRef.current?.stop() : startListening}
                   disabled={!Recognition || isEnded || !sessionId || isProcessing}
                   aria-label={isListening ? "Stop listening" : "Start speaking"}
                   title={isListening ? "Stop listening" : "Start speaking"}
-                  className={`mb-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${isListening ? "bg-[rgba(248,113,113,0.14)] text-[#f87171]" : "bg-[#171d2e] text-[#b4b8cc] hover:text-white"}`}
+                  className={`mb-1 flex h-11 w-11 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${isListening ? "bg-[#fee2e2] text-[#b91c1c]" : "bg-white text-[#1d4ed8] hover:bg-[#eff6ff]"}`}
                 >
                   {isListening ? <MicOff className="h-5 w-5" aria-hidden="true" /> : <Mic className="h-5 w-5" aria-hidden="true" />}
                 </button>
@@ -585,94 +645,69 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
                   disabled={!sessionId || isEnded || isProcessing || !textMessage.trim()}
                   aria-label="Send message"
                   title="Send message"
-                  className="mb-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[#7357e8] text-white transition-colors hover:bg-[#6448d5] disabled:cursor-not-allowed disabled:opacity-40"
+                  className="mb-1 flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-[#1d4ed8] text-white transition-colors hover:bg-[#1e40af] disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   <Send className="h-4 w-4" aria-hidden="true" />
                 </button>
               </form>
-            )}
+            </div>
+          )}
 
             {!consented ? (
-              <div className="rounded-lg border border-[rgba(240,173,121,0.2)] bg-[rgba(240,173,121,0.06)] p-4">
-                <p className="text-sm font-semibold text-[#f0c59f]">Before you begin</p>
-                <p className="mt-1 text-sm leading-6 text-[#c5a98e]">
-                  Your recognized speech will be sent to our backend and AI provider and saved with your business profile.
-                </p>
+              <div className="flex flex-1 items-center justify-center px-4 py-10">
                 <button
                   type="button"
                   onClick={beginOnboarding}
                   disabled={isStarting}
-                  className="mt-4 rounded-md bg-[#7357e8] px-4 py-2 text-sm font-medium text-white hover:bg-[#6448d5] disabled:opacity-50"
+                  className="min-w-40 rounded-md bg-[#1d4ed8] px-8 py-4 text-base font-semibold text-white shadow-lg transition-colors hover:bg-[#1e40af] disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  {isStarting ? "Starting..." : "I agree and start"}
+                  {isStarting ? "Starting..." : "Start"}
                 </button>
-                {savedSessions.length > 0 && (
-                  <div className="mt-5 border-t border-[rgba(240,173,121,0.14)] pt-4">
-                    <h2 className="text-sm font-semibold text-[#f0c59f]">Resume onboarding</h2>
-                    <ul className="mt-2 space-y-2">
-                      {savedSessions.map(savedSession => (
-                        <li key={savedSession.id} className="flex items-center justify-between gap-3 text-sm">
-                          <span className="min-w-0 truncate text-[#c5a98e]">
-                            {savedSession.profile.business_name || "Business profile in progress"} · {new Date(savedSession.updated_at).toLocaleDateString()}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => void resumeOnboarding(savedSession.id)}
-                            disabled={isStarting}
-                            className="shrink-0 rounded-md border border-[rgba(240,173,121,0.25)] px-3 py-1.5 text-xs text-[#f0c59f] hover:bg-[rgba(240,173,121,0.08)] disabled:opacity-50"
-                          >
-                            {savedSession.agent_id ? "Open linked draft" : "Resume"}
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
               </div>
             ) : (
               <>
                 {profile && completionRecorded && (
-                  <section className="border-t border-[rgba(99,102,241,0.12)] pt-5" aria-label="Business profile">
-                    <h2 className="text-sm font-semibold text-[#e2e4ef]">Review business profile</h2>
-                    <p className="mt-1 text-xs text-[#a0a3b8]">Correct any details before they are used to configure the draft.</p>
+                  <section className="mx-3 mb-4 rounded-lg border border-border bg-card p-4 sm:mx-5 sm:p-5" aria-label="Business profile">
+                    <h2 className="text-sm font-semibold text-card-foreground">Review business profile</h2>
+                    <p className="mt-1 text-xs text-muted-foreground">Correct any details before they are used to configure the draft.</p>
                     <div className="mt-3 grid gap-3 sm:grid-cols-2">
                       {editableProfileFields.map(field => {
                         const value = profile[field];
                         const label = field.replace(/_/g, " ").replace(/^./, (char: string) => char.toUpperCase());
                         const textValue = Array.isArray(value) ? value.join("\n") : value || "";
                         return (
-                          <label key={field} className="text-xs capitalize text-[#a0a3b8]">
+                          <label key={field} className="text-xs capitalize text-muted-foreground">
                             {label}
                             {listProfileFields.has(field) ? (
                               <textarea
                                 rows={2}
                                 value={textValue}
                                 onChange={event => updateProfileField(field, event.target.value)}
-                                className="mt-1 block w-full rounded-md border border-[rgba(99,102,241,0.18)] bg-[#111520] px-3 py-2 text-sm normal-case text-[#d5d7e2] outline-none focus:ring-1 focus:ring-[#6366f1]"
+                                className="mt-1 block w-full rounded-md border border-border bg-input-background px-3 py-2 text-sm normal-case text-foreground outline-none focus:ring-1 focus:ring-ring"
                               />
                             ) : (
                               <input
                                 value={textValue}
                                 onChange={event => updateProfileField(field, event.target.value)}
-                                className="mt-1 block w-full rounded-md border border-[rgba(99,102,241,0.18)] bg-[#111520] px-3 py-2 text-sm normal-case text-[#d5d7e2] outline-none focus:ring-1 focus:ring-[#6366f1]"
+                                className="mt-1 block w-full rounded-md border border-border bg-input-background px-3 py-2 text-sm normal-case text-foreground outline-none focus:ring-1 focus:ring-ring"
                               />
                             )}
                           </label>
                         );
                       })}
                     </div>
-                    {profile.unresolved_questions.length > 0 && <p className="mt-3 text-xs text-[#a0a3b8]">Open details: {profile.unresolved_questions.join(" · ")}</p>}
-                    {profile.conflicts.length > 0 && <p className="mt-2 text-xs text-[#f0ad79]">Conflicting statements: {profile.conflicts.map(conflict => conflict.statement).join(" · ")}</p>}
+                    {profile.unresolved_questions.length > 0 && <p className="mt-3 text-xs text-muted-foreground">Open details: {profile.unresolved_questions.join(" · ")}</p>}
+                    {profile.conflicts.length > 0 && <p className="mt-2 text-xs text-destructive">Conflicting statements: {profile.conflicts.map(conflict => conflict.statement).join(" · ")}</p>}
                   </section>
                 )}
 
                 {profile && completionRecorded && (
-                  <div className="border-t border-[rgba(99,102,241,0.12)] pt-4">
+                  <div className="mx-3 mb-4 border-t border-border px-1 pt-4 sm:mx-5">
                     <button
                       type="button"
                       onClick={() => void continueToDraft()}
                       disabled={isSavingReview || (!completionRecorded && !associatedAgentId)}
-                      className="rounded-md bg-[#7357e8] px-4 py-2 text-sm font-medium text-white hover:bg-[#6448d5] disabled:opacity-50"
+                      className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
                     >
                       {isSavingReview ? "Creating agent..." : associatedAgentId ? "Open linked agent testing" : "Create agent and start testing"}
                     </button>
@@ -682,41 +717,41 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
               </>
             )}
 
-            <div className="flex flex-col items-center gap-4 border-t border-[rgba(99,102,241,0.12)] pt-5">
-              <p aria-live="polite" className="min-h-5 text-center text-sm text-[#a0a3b8]">
+            <div className="flex flex-col items-center gap-3 border-t border-[#d6d3d1] bg-[#f8fafc] px-4 py-4">
+              <p aria-live="polite" className={`min-h-5 text-center text-sm ${voiceMessage && /failed|unavailable|could not|denied|error|expired/i.test(voiceMessage) ? "text-[#b91c1c]" : "text-[#475569]"}`}>
                 {voiceMessage || (!Recognition
                   ? "Speech recognition is not supported here. You can type instead."
                   : !consented
-                    ? "Review consent to begin."
+                    ? "Ready to begin."
                     : "Speak naturally; your profile updates as you share details.")}
               </p>
-              <div className="flex flex-wrap items-center justify-center gap-3">
-                <button
-                  type="button"
-                  onClick={replayAssistantReply}
-                  disabled={!consented || !speechOutputAvailable || isEnded}
-                  aria-label={assistantReply ? "Replay assistant reply" : "Play greeting aloud"}
-                  title={assistantReply ? "Replay assistant reply" : "Play greeting aloud"}
-                  className="flex h-11 w-11 items-center justify-center rounded-full border border-[rgba(99,102,241,0.22)] bg-[#171d2e] text-[#b4b8cc] transition-colors hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  <Volume2 className="h-4 w-4" aria-hidden="true" />
-                </button>
-                <button
-                  type="button"
-                  onClick={endSession}
-                  disabled={isEnded}
-                  aria-label="End voice session"
-                  title="End voice session"
-                  className="flex h-11 w-11 items-center justify-center rounded-full border border-[rgba(248,113,113,0.25)] bg-[rgba(248,113,113,0.08)] text-[#fca5a5] transition-colors hover:bg-[rgba(248,113,113,0.16)] disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  <PhoneOff className="h-4 w-4" aria-hidden="true" />
-                </button>
-              </div>
-              <p className="text-xs text-[#71748a]">Browser speech recognition may use its own service. Only recognized text is sent for onboarding; microphone audio is not uploaded.</p>
+              {consented && mode === "voice" && (
+                <div className="flex flex-wrap items-center justify-center gap-3">
+                  <button
+                    type="button"
+                    onClick={replayAssistantReply}
+                    disabled={!consented || !speechOutputAvailable || isEnded}
+                    aria-label={assistantReply ? "Replay assistant reply" : "Play greeting aloud"}
+                    title={assistantReply ? "Replay assistant reply" : "Play greeting aloud"}
+                    className="flex h-10 w-10 items-center justify-center rounded-full border border-[#cbd5e1] bg-white text-[#1e3a8a] transition-colors hover:bg-[#eff6ff] disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    <Volume2 className="h-4 w-4" aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={endSession}
+                    disabled={isEnded}
+                    className="flex h-10 items-center gap-2 rounded-full border border-[#fecaca] bg-[#fef2f2] px-4 text-sm font-medium text-[#b91c1c] transition-colors hover:bg-[#fee2e2] disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    <PhoneOff className="h-4 w-4" aria-hidden="true" />
+                    End Session
+                  </button>
+                </div>
+              )}
+              <p className="max-w-2xl text-center text-xs text-[#64748b]">Browser speech recognition may use its own service. Only recognized text is sent for onboarding; microphone audio is not uploaded.</p>
             </div>
-          </div>
-        </section>
-      </div>
+        </div>
+      </section>
     </main>
   );
 }
