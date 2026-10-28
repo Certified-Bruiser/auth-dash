@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { Mic, MicOff, Paperclip, PhoneOff, Send, Volume2 } from "lucide-react";
 import { supabase } from "../lib/supabase";
 
@@ -149,34 +149,59 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
   const endedRef = useRef(false);
   const activeRef = useRef(active);
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioUrlRef = useRef<string | null>(null);
+  const playbackGenerationRef = useRef(0);
   const modeRef = useRef<"chat" | "voice">("voice");
   const modeEpochRef = useRef(0);
   const Recognition = getRecognitionConstructor();
   const speechOutputAvailable = typeof window !== "undefined" && "speechSynthesis" in window;
 
+  const stopVoicePlayback = useCallback(() => {
+    playbackGenerationRef.current += 1;
+    window.speechSynthesis?.cancel();
+    utteranceRef.current = null;
+
+    const audio = audioRef.current;
+    audioRef.current = null;
+    if (audio) {
+      audio.onended = null;
+      audio.onerror = null;
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+    }
+
+    if (audioUrlRef.current) {
+      URL.revokeObjectURL(audioUrlRef.current);
+      audioUrlRef.current = null;
+    }
+    setIsSpeaking(false);
+  }, []);
+
   const switchMode = (nextMode: "chat" | "voice") => {
     if (modeRef.current === nextMode) return;
     modeRef.current = nextMode;
     modeEpochRef.current += 1;
+    stopVoicePlayback();
     setMode(nextMode);
-    if (nextMode === "chat") {
-      window.speechSynthesis?.cancel();
-      utteranceRef.current = null;
-      setIsSpeaking(false);
-    }
   };
 
-  const speakText = (text: string) => {
-    if (modeRef.current !== "voice" || endedRef.current || !activeRef.current) return;
+  const speakWithBrowser = (text: string, generation: number) => {
+    if (
+      generation !== playbackGenerationRef.current
+      || modeRef.current !== "voice"
+      || endedRef.current
+      || !activeRef.current
+    ) return;
     if (!speechOutputAvailable || isEnded) {
       setVoiceMessage("Speech playback is unavailable in this browser.");
       return;
     }
 
-    window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.onstart = () => {
-      if (utteranceRef.current === utterance && modeRef.current === "voice") setIsSpeaking(true);
+      if (utteranceRef.current === utterance && generation === playbackGenerationRef.current) setIsSpeaking(true);
     };
     utterance.onend = () => {
       if (utteranceRef.current === utterance) {
@@ -188,7 +213,7 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
       if (utteranceRef.current === utterance) {
         setIsSpeaking(false);
         utteranceRef.current = null;
-        if (modeRef.current === "voice") {
+        if (generation === playbackGenerationRef.current && modeRef.current === "voice") {
           setVoiceMessage("The greeting could not be played. Use the replay control to try again.");
         }
       }
@@ -197,9 +222,61 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
     window.speechSynthesis.speak(utterance);
   };
 
+  const speakText = async (text: string) => {
+    if (modeRef.current !== "voice" || endedRef.current || !activeRef.current) return;
+    stopVoicePlayback();
+    const generation = playbackGenerationRef.current;
+    const fallback = () => speakWithBrowser(text, generation);
+
+    try {
+      const audioBlob = await onboardingRequest("/speech", {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      }, "blob") as Blob;
+      if (
+        generation !== playbackGenerationRef.current
+        || modeRef.current !== "voice"
+        || endedRef.current
+        || !activeRef.current
+      ) return;
+
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(audioUrl);
+      audioRef.current = audio;
+      audioUrlRef.current = audioUrl;
+      const releaseAudio = () => {
+        if (audioRef.current !== audio) return false;
+        audioRef.current = null;
+        audioUrlRef.current = null;
+        URL.revokeObjectURL(audioUrl);
+        return true;
+      };
+      audio.onplay = () => {
+        if (generation === playbackGenerationRef.current) setIsSpeaking(true);
+      };
+      audio.onended = () => {
+        if (releaseAudio()) setIsSpeaking(false);
+      };
+      audio.onerror = () => {
+        if (releaseAudio()) fallback();
+      };
+      try {
+        await audio.play();
+      } catch {
+        if (releaseAudio()) fallback();
+      }
+    } catch {
+      fallback();
+    }
+  };
+
   const replayAssistantReply = () => speakText(assistantReply || greeting);
 
-  const onboardingRequest = async (path: string, init: RequestInit = {}) => {
+  const onboardingRequest = async (
+    path: string,
+    init: RequestInit = {},
+    responseType: "json" | "blob" = "json",
+  ) => {
     const { data: { session } } = await supabase.auth.getSession();
     if (!session?.access_token) throw new Error("Your sign-in session has expired. Sign in again to continue.");
 
@@ -211,8 +288,20 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
         ...(init.headers || {}),
       },
     });
-    const data = await response.json().catch(() => null);
-    if (!response.ok) throw new Error(data?.detail || "Onboarding could not be saved.");
+    const data = responseType === "blob"
+      ? await response.blob().catch(() => null)
+      : await response.json().catch(() => null);
+    if (!response.ok) {
+      let detail = responseType === "json" ? data?.detail : undefined;
+      if (responseType === "blob" && data instanceof Blob) {
+        try {
+          detail = JSON.parse(await data.text())?.detail;
+        } catch {
+          detail = undefined;
+        }
+      }
+      throw new Error(detail || "Onboarding could not be saved.");
+    }
     return data;
   };
 
@@ -391,9 +480,9 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
   useEffect(() => {
     return () => {
       recognitionRef.current?.abort();
-      window.speechSynthesis?.cancel();
+      stopVoicePlayback();
     };
-  }, []);
+  }, [stopVoicePlayback]);
 
   useEffect(() => {
     activeRef.current = active;
@@ -403,9 +492,8 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
     transcriptRef.current = "";
     setTranscript("");
     setIsListening(false);
-    window.speechSynthesis?.cancel();
-    setIsSpeaking(false);
-  }, [active]);
+    stopVoicePlayback();
+  }, [active, stopVoicePlayback]);
 
   useEffect(() => {
     const conversation = conversationRef.current;
@@ -514,10 +602,8 @@ export default function VoiceOnboarding({ active = true, onCreateAgent }: VoiceO
     endedRef.current = true;
     recognitionRef.current?.abort();
     recognitionRef.current = null;
-    window.speechSynthesis?.cancel();
-    utteranceRef.current = null;
+    stopVoicePlayback();
     setIsListening(false);
-    setIsSpeaking(false);
     setIsEnded(true);
     setVoiceMessage("Session ended. Your saved onboarding profile remains available.");
   };
