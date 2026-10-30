@@ -14,7 +14,7 @@ import {
   DialogTitle,
 } from "./components/ui/dialog";
 import {
-  Mic, Volume2, Brain, Database, MessageSquare, Wrench, Shield,
+  Mic, Volume2, Brain, Database, MessageSquare, Wrench, Shield, Paperclip,
   Play, Upload, Search, Plus, Trash2, Copy, CheckCircle, Clock,
   AlertCircle, X, ArrowLeft, ArrowRight, Globe, Lock, Zap,
   Phone, StopCircle, Send, BookOpen, Link, FileText, Tag,
@@ -33,6 +33,7 @@ type View = "dashboard" | "wizard" | "voice-onboarding" | "voice-test" | "use-ag
 
 interface Agent {
   id: string;
+  onboarding_session_id?: string | null;
   name: string;
   description: string;
   agentType: string;
@@ -112,7 +113,24 @@ interface TestMessage {
   role: "user" | "agent";
   content: string;
   timestamp: string;
+  interim?: boolean;
   latency?: number;
+  attachment?: string;
+  images?: { name: string; previewUrl: string }[];
+}
+
+interface TestImageAttachment {
+  file: File;
+  previewUrl: string;
+}
+
+function chatHistoryFromTranscript(messages: TestMessage[]) {
+  return messages.filter(message => !message.interim).flatMap(message => {
+    const content = message.content.trim();
+    return content
+      ? [{ role: message.role === "user" ? "user" as const : "assistant" as const, content }]
+      : [];
+  });
 }
 
 interface TestSpeechRecognitionResult {
@@ -151,6 +169,33 @@ interface GeneratedPrompt {
   escalationRules?: string;
   humanHandoffConditions?: string;
   suggestions: string[];
+}
+
+interface ProviderCatalogEntry {
+  id: string;
+  name: string;
+  models?: string[];
+  voices?: string[];
+}
+
+interface ProviderCatalog {
+  stt: ProviderCatalogEntry[];
+  llm: ProviderCatalogEntry[];
+  tts: ProviderCatalogEntry[];
+}
+
+const MAX_TEST_IMAGE_SIZE_BYTES = 8 * 1024 * 1024;
+const MAX_TEST_IMAGES_PER_MESSAGE = 4;
+const TEST_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+
+async function fileToBase64(file: File) {
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(new Error("The image could not be read."));
+    reader.readAsDataURL(file);
+  });
+  return dataUrl.split(",", 2)[1] || "";
 }
 
 // ─── PROVIDER DATA ────────────────────────────────────────────────────────────
@@ -445,15 +490,15 @@ const defaultForm: AgentForm = {
 };
 
 function voiceAgentForm(fields: AgentFields): AgentForm {
-  const identity = fields.name || "Business Assistant";
+  const identity = fields.name || "Voice Agent";
   const defaultInstructions = [
-    `You are the customer-facing assistant for ${identity}.`,
+    `You are ${identity}.`,
     fields.purpose ? `Your purpose is: ${fields.purpose}.` : "",
     fields.goals ? `Your responsibilities are:\n${fields.goals}` : "",
-    fields.businessContext ? `Use these owner-confirmed business details:\n${fields.businessContext}` : "",
+    fields.businessContext ? `Use this user-provided context when relevant:\n${fields.businessContext}` : "",
     fields.tone ? `Use a ${fields.tone} tone.` : "",
     fields.language ? `Communicate in ${fields.language}.` : "",
-    "Follow the confirmed business rules. Do not invent business facts, policies, prices, product details, guarantees, or capabilities.",
+    "Follow the user's instructions and constraints. Do not invent facts, access, actions, or capabilities.",
   ].filter(Boolean).join("\n\n");
 
   return {
@@ -1651,59 +1696,131 @@ function SecurityStep({ form, onChange, onGenerate }: StepProps) {
   );
 }
 
-function TestStep({ form, agentId, accessToken, showConfiguredGreeting = true }: {
+function TestStep({ form, agentId, accessToken, showConfiguredGreeting = true, allowImageAttachments = false, active = true }: {
   form: AgentForm;
   agentId?: string;
   accessToken: string;
   showConfiguredGreeting?: boolean;
+  allowImageAttachments?: boolean;
+  active?: boolean;
 }) {
   const [messages, setMessages] = useState<TestMessage[]>([]);
   const [input, setInput] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [recordingError, setRecordingError] = useState("");
+  const [attachmentError, setAttachmentError] = useState("");
+  const [imageFiles, setImageFiles] = useState<TestImageAttachment[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [pipeline, setPipeline] = useState<"idle" | "stt" | "llm" | "tts">("idle");
   const [sessionActive, setSessionActive] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
   const recognitionRef = useRef<TestSpeechRecognition | null>(null);
+  const imagePreviewUrlsRef = useRef(new Set<string>());
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
   useEffect(() => () => recognitionRef.current?.abort(), []);
+  useEffect(() => {
+    if (active) return;
+    recognitionRef.current?.abort();
+    recognitionRef.current = null;
+    setIsRecording(false);
+  }, [active]);
+  useEffect(() => () => {
+    for (const previewUrl of imagePreviewUrlsRef.current) URL.revokeObjectURL(previewUrl);
+    imagePreviewUrlsRef.current.clear();
+  }, []);
 
   const startSession = () => {
     setSessionActive(true);
     setMessages(showConfiguredGreeting
-      ? [{ id: "0", role: "agent", content: form.greeting || "Hi! How can I help you today?", timestamp: new Date().toLocaleTimeString() }]
+      ? [{ id: "0", role: "agent", content: form.greeting || "Hi! How can I help you today?", timestamp: new Date().toISOString() }]
       : []);
   };
 
-  const sendMessage = async (text: string) => {
-    if (!text.trim() || isProcessing) return;
-    const userMsg: TestMessage = { id: Date.now().toString(), role: "user", content: text, timestamp: new Date().toLocaleTimeString() };
+  const sendMessage = async (text: string, selectedImages = imageFiles) => {
+    if ((!text.trim() && selectedImages.length === 0) || isProcessing) return;
+    const message = text.trim() || "Please describe this image.";
+    const history = chatHistoryFromTranscript(messages);
+    const userMsg: TestMessage = {
+      id: Date.now().toString(),
+      role: "user",
+      content: message,
+      timestamp: new Date().toISOString(),
+      images: selectedImages.map(({ file, previewUrl }) => ({ name: file.name, previewUrl })),
+    };
     setMessages(prev => [...prev, userMsg]);
     setInput("");
+    setImageFiles([]);
+    setAttachmentError("");
+    setRecordingError("");
     setIsProcessing(true);
-    setPipeline("llm");
     if (!agentId) {
-      setMessages(prev => [...prev, { id: (Date.now() + 1).toString(), role: "agent", content: "Save and publish this agent before testing it.", timestamp: new Date().toLocaleTimeString() }]);
+      setMessages(prev => [...prev, { id: (Date.now() + 1).toString(), role: "agent", content: "Save and publish this agent before testing it.", timestamp: new Date().toISOString() }]);
       setIsProcessing(false);
-      setPipeline("idle");
       return;
     }
     try {
       const data = await apiRequest("/chat", {
         method: "POST",
         accessToken,
-        body: JSON.stringify({ agent_id: agentId, message: text }),
+        body: JSON.stringify({
+          agent_id: agentId,
+          message,
+          history,
+          images: await Promise.all(selectedImages.map(async ({ file }) => ({
+            mime_type: file.type,
+            data: await fileToBase64(file),
+          }))),
+        }),
       });
-      setMessages(prev => [...prev, { id: (Date.now() + 1).toString(), role: "agent", content: data.response, timestamp: new Date().toLocaleTimeString() }]);
+      setMessages(prev => [...prev, { id: (Date.now() + 1).toString(), role: "agent", content: data.response, timestamp: new Date().toISOString() }]);
     } catch (error) {
       console.error("Chat request failed:", error);
-      setMessages(prev => [...prev, { id: (Date.now() + 1).toString(), role: "agent", content: error instanceof Error ? error.message : "Chat request failed", timestamp: new Date().toLocaleTimeString() }]);
+      setMessages(prev => [...prev, { id: (Date.now() + 1).toString(), role: "agent", content: error instanceof Error ? error.message : "Chat request failed", timestamp: new Date().toISOString() }]);
     } finally {
       setIsProcessing(false);
-      setPipeline("idle");
     }
+  };
+
+  const selectImages = (files: File[]) => {
+    const additions: TestImageAttachment[] = [];
+    let error = "";
+    for (const file of files) {
+      if (imageFiles.length + additions.length >= MAX_TEST_IMAGES_PER_MESSAGE) {
+        error = `Attach up to ${MAX_TEST_IMAGES_PER_MESSAGE} images per message.`;
+        break;
+      }
+      if (!TEST_IMAGE_TYPES.has(file.type)) {
+        error = "Choose PNG, JPEG, or WebP images.";
+        continue;
+      }
+      if (file.size > MAX_TEST_IMAGE_SIZE_BYTES) {
+        error = "Each image must be 8 MB or smaller.";
+        continue;
+      }
+      const previewUrl = URL.createObjectURL(file);
+      imagePreviewUrlsRef.current.add(previewUrl);
+      additions.push({ file, previewUrl });
+    }
+    if (error) setAttachmentError(error);
+    else setAttachmentError("");
+    if (additions.length) setImageFiles(current => [...current, ...additions]);
+  };
+
+  const removeSelectedImage = (previewUrl: string) => {
+    URL.revokeObjectURL(previewUrl);
+    imagePreviewUrlsRef.current.delete(previewUrl);
+    setImageFiles(current => current.filter(image => image.previewUrl !== previewUrl));
+  };
+
+  const reset = () => {
+    for (const previewUrl of imagePreviewUrlsRef.current) URL.revokeObjectURL(previewUrl);
+    imagePreviewUrlsRef.current.clear();
+    setMessages([]);
+    setImageFiles([]);
+    setSessionActive(false);
+    setIsProcessing(false);
+    setIsRecording(false);
   };
 
   const toggleRecording = () => {
@@ -1752,133 +1869,214 @@ function TestStep({ form, agentId, accessToken, showConfiguredGreeting = true }:
     }
   };
 
-  const reset = () => { setMessages([]); setSessionActive(false); setPipeline("idle"); setIsProcessing(false); setIsRecording(false); };
-
-  const pipelineSteps = [
-    { id: "stt", label: STT_PROVIDERS[form.sttProvider]?.badge || "STT", name: "Speech → Text" },
-    { id: "llm", label: LLM_PROVIDERS[form.llmProvider]?.badge || "LLM", name: "LLM Response" },
-    { id: "tts", label: TTS_PROVIDERS[form.ttsProvider]?.badge || "TTS", name: "Text → Voice" },
-  ];
-
   return (
-    <div className="space-y-4">
-      <SectionHeader icon={PlayCircle} title="Live Voice Playground" subtitle="Test your agent end-to-end before publishing. Speak or type to interact." />
-      {recordingError && <p role="alert" className="text-sm text-[#f87171]">{recordingError}</p>}
-
-      {/* Pipeline status */}
-      <div className="flex items-center gap-2 p-3 bg-[#0a0d16] border border-[rgba(99,102,241,0.14)] rounded-xl">
-        {pipelineSteps.map((step, i) => (
-          <div key={step.id} className="flex items-center gap-2 flex-1">
-            <div className={cn(
-              "flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-mono flex-1 justify-center transition-all",
-              pipeline === step.id ? "bg-[rgba(99,102,241,0.25)] text-[#a78bfa] border border-[rgba(99,102,241,0.4)]" :
-              pipeline === "idle" && sessionActive ? "bg-[rgba(34,197,94,0.08)] text-[#22c55e] border border-[rgba(34,197,94,0.2)]" :
-              "bg-[#111520] text-[#636680] border border-transparent"
-            )}>
-              <span className="font-bold">{step.label}</span>
-              <span className="hidden sm:block text-[10px] opacity-70">{step.name}</span>
-              {pipeline === step.id && <div className="w-1.5 h-1.5 rounded-full bg-[#a78bfa] animate-pulse" />}
+    <main className="min-h-[calc(100vh-3.5rem)] bg-background px-0 py-0 text-foreground sm:px-5 sm:py-5" style={{ fontFamily: "DM Sans, sans-serif" }}>
+      <section className="mx-auto flex min-h-[calc(100vh-3.5rem)] w-full max-w-5xl flex-col overflow-hidden bg-card shadow-sm sm:min-h-[calc(100vh-6rem)] sm:rounded-xl sm:border sm:border-border">
+        <header className="flex shrink-0 items-center justify-between gap-3 border-b border-[#1e3a8a] bg-[#172554] px-4 py-3 text-white sm:px-6">
+          <div className="flex min-w-0 items-center gap-3">
+            <img src="/favicon.svg" alt="VoxAgent" className="h-11 w-11 shrink-0 rounded-full bg-white object-contain" />
+            <div className="min-w-0">
+              <h2 className="truncate text-base font-semibold text-white sm:text-lg" style={{ fontFamily: "Outfit, sans-serif" }}>VoxAgent</h2>
+              <p className="truncate text-xs text-blue-100/80">{form.name || "Agent testing"}</p>
             </div>
-            {i < 2 && <ChevronRight className="w-3 h-3 text-[#3d4060] flex-shrink-0" />}
           </div>
-        ))}
-      </div>
+          <div className="flex shrink-0 items-center gap-2 text-xs text-blue-100" role="status">
+            {isProcessing ? <span className="h-2 w-2 animate-pulse rounded-full bg-chart-5" /> : <span className={`h-2 w-2 rounded-full ${sessionActive ? "bg-blue-300" : "bg-blue-100/50"}`} />}
+            <span className="hidden text-[11px] sm:inline sm:text-xs">{isProcessing ? "Responding" : sessionActive ? "Active" : "Ready"}</span>
+          </div>
+        </header>
 
-      {/* Chat area */}
-      <div className="bg-[#0a0d16] border border-[rgba(99,102,241,0.14)] rounded-xl overflow-hidden" style={{ height: 380 }}>
+        <div className="flex min-h-0 flex-1 flex-col">
         {!sessionActive ? (
-          <div className="h-full flex flex-col items-center justify-center gap-4">
-            <div className="w-16 h-16 rounded-2xl bg-[rgba(99,102,241,0.1)] border border-[rgba(99,102,241,0.2)] flex items-center justify-center">
-              <Bot className="w-7 h-7 text-[#6366f1]" />
-            </div>
-            <div className="text-center">
-              <p className="text-sm text-[#e2e4ef] font-medium">{form.name || "Voice Agent"} is ready to test</p>
-              <p className="text-xs text-[#636680] mt-1">Voice: {TTS_PROVIDERS[form.ttsProvider]?.voices[form.ttsModel]?.find(v => v.id === form.voice)?.name || form.voice} · {LLM_PROVIDERS[form.llmProvider]?.name}</p>
-            </div>
-            <button onClick={startSession}
-              className="flex items-center gap-2 px-5 py-2.5 bg-[#6366f1] text-white text-sm rounded-lg hover:bg-[#4f46e5] transition-colors font-medium">
-              <PlayCircle className="w-4 h-4" /> Start Test Session
+          <div className="flex flex-1 items-center justify-center px-4 py-10">
+            <button type="button" onClick={startSession} className="min-w-40 rounded-md bg-[#1d4ed8] px-8 py-4 text-base font-semibold text-white shadow-lg transition-colors hover:bg-[#1e40af]">
+              Start Test Session
             </button>
           </div>
         ) : (
-          <div className="h-full flex flex-col">
-            <div className="flex items-center gap-2 px-4 py-2.5 border-b border-[rgba(99,102,241,0.14)]">
-              <div className="w-2 h-2 rounded-full bg-[#22c55e] animate-pulse" />
-              <span className="text-xs text-[#636680]">Session active — {messages.length} messages</span>
-              <button onClick={reset} className="ml-auto text-[#636680] hover:text-[#ef4444] transition-colors">
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </div>
-            <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-thin">
+          <>
+            <div className="min-h-[18rem] flex-1 space-y-3 overflow-y-auto bg-[#efeae2] px-3 py-5 sm:px-7 sm:py-7" aria-live="polite" aria-label="Conversation">
               {messages.map(msg => (
-                <div key={msg.id} className={cn("flex gap-2.5", msg.role === "user" ? "flex-row-reverse" : "")}>
-                  <div className={cn(
-                    "w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 text-xs",
-                    msg.role === "user" ? "bg-[#1a2030] text-[#636680]" : "bg-[rgba(99,102,241,0.2)] text-[#6366f1]"
-                  )}>
-                    {msg.role === "user" ? <User className="w-3.5 h-3.5" /> : <Bot className="w-3.5 h-3.5" />}
-                  </div>
-                  <div className={cn("max-w-[75%]", msg.role === "user" ? "items-end" : "items-start", "flex flex-col gap-1")}>
-                    <div className={cn(
-                      "px-3 py-2 rounded-xl text-sm",
-                      msg.role === "user"
-                        ? "bg-[#1a2030] text-[#b4b8cc]"
-                        : "bg-[rgba(99,102,241,0.12)] text-[#e2e4ef] border border-[rgba(99,102,241,0.15)]"
-                    )}>
-                      {msg.content}
-                    </div>
-                    <div className={cn("flex items-center gap-2", msg.role === "user" ? "flex-row-reverse" : "")}>
-                      <span className="text-[10px] text-[#3d4060] font-mono">{msg.timestamp}</span>
-                      {msg.latency && <span className="text-[10px] text-[#636680] font-mono">{msg.latency}ms</span>}
-                    </div>
+                <div key={msg.id} className={`flex items-start gap-2 ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+                  {msg.role === "agent" && <img src="/favicon.svg" alt="" className="mt-1 h-7 w-7 shrink-0 rounded-full bg-[#dbeafe] object-contain" />}
+                  <div className={`w-fit max-w-[88%] rounded-xl border px-3.5 py-2.5 shadow-sm sm:max-w-[75%] sm:px-4 ${msg.role === "user"
+                    ? "rounded-tr-sm border-[#bfdbfe] bg-[#dbeafe] text-[#172554]"
+                    : "rounded-tl-sm border-white bg-white text-[#172554]"}`}>
+                    <p className="whitespace-pre-wrap break-words text-sm leading-6">{msg.content}</p>
+                    {msg.images && msg.images.length > 0 && (
+                      <div className="mt-2 grid grid-cols-2 gap-2">
+                        {msg.images.map(image => (
+                          <img key={image.previewUrl} src={image.previewUrl} alt={`Attached image: ${image.name}`} title={image.name} className="max-h-36 max-w-full rounded-md object-contain" />
+                        ))}
+                      </div>
+                    )}
+                    <p className="mt-1 text-right text-[10px] text-slate-600">
+                      {[msg.role === "agent" ? "VoxAgent" : "", new Date(msg.timestamp).toLocaleString([], { dateStyle: "short", timeStyle: "short" })].filter(Boolean).join(" · ")}
+                    </p>
                   </div>
                 </div>
               ))}
               {isProcessing && (
-                <div className="flex gap-2.5">
-                  <div className="w-7 h-7 rounded-full bg-[rgba(99,102,241,0.2)] flex items-center justify-center flex-shrink-0">
-                    <Bot className="w-3.5 h-3.5 text-[#6366f1]" />
-                  </div>
-                  <div className="px-3 py-2 rounded-xl bg-[rgba(99,102,241,0.08)] border border-[rgba(99,102,241,0.15)] flex items-center gap-1.5">
-                    <span className="text-xs text-[#636680] font-mono capitalize">{pipeline}...</span>
-                    <div className="flex gap-1">
-                      {[0, 1, 2].map(i => (
-                        <div key={i} className="w-1.5 h-1.5 rounded-full bg-[#6366f1] animate-bounce" style={{ animationDelay: `${i * 150}ms` }} />
-                      ))}
-                    </div>
-                  </div>
+                <div className="mr-auto w-fit rounded-xl rounded-tl-sm border border-white bg-white px-4 py-3 text-xs text-slate-600 shadow-sm" role="status">
+                  {recordingError || "Preparing your response..."}
                 </div>
               )}
               <div ref={chatEndRef} />
             </div>
-            <div className="p-3 border-t border-[rgba(99,102,241,0.14)] flex items-center gap-2">
-              <button
-                onClick={toggleRecording}
-                className={cn(
-                  "w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 transition-all",
-                  isRecording
-                    ? "bg-[#ef4444] text-white animate-pulse"
-                    : "bg-[rgba(99,102,241,0.15)] text-[#6366f1] hover:bg-[rgba(99,102,241,0.25)]"
-                )}
-              >
-                {isRecording ? <StopCircle className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-              </button>
-              <input
-                value={input} onChange={e => setInput(e.target.value)}
-                onKeyDown={e => { if (e.key === "Enter") sendMessage(input); }}
-                placeholder={isRecording ? "Listening..." : "Type or click mic to speak..."}
-                disabled={isRecording || isProcessing}
-                className="flex-1 px-3 py-2 bg-[#111520] border border-[rgba(99,102,241,0.18)] rounded-lg text-sm text-[#e2e4ef] placeholder-[#3d4060] outline-none focus:ring-1 focus:ring-[#6366f1] disabled:opacity-50"
-              />
-              <button onClick={() => sendMessage(input)} disabled={!input.trim() || isProcessing}
-                className="w-9 h-9 rounded-full flex items-center justify-center bg-[#6366f1] text-white hover:bg-[#4f46e5] disabled:opacity-40 transition-colors flex-shrink-0">
-                <Send className="w-4 h-4" />
+
+            <div className="shrink-0 border-t border-[#d6d3d1] bg-[#f8fafc] px-3 py-3 sm:px-5">
+              {allowImageAttachments && imageFiles.length > 0 && (
+                <div className="mb-2 flex flex-wrap gap-2">
+                  {imageFiles.map(image => (
+                    <div key={image.previewUrl} className="relative h-16 w-16">
+                      <img src={image.previewUrl} alt={`Preview: ${image.file.name}`} className="h-full w-full rounded-md object-cover" />
+                      <button type="button" onClick={() => removeSelectedImage(image.previewUrl)} aria-label={`Remove ${image.file.name}`} title="Remove image" className="absolute -right-1 -top-1 flex h-5 w-5 items-center justify-center rounded-full bg-[#1a2030] text-white">
+                        <X className="h-3 w-3" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <form onSubmit={event => { event.preventDefault(); void sendMessage(input); }} className="flex items-end gap-1.5 sm:gap-2">
+                <div className="flex min-h-12 min-w-0 flex-1 items-end gap-1 rounded-3xl bg-white px-2 shadow-sm ring-1 ring-[#cbd5e1] sm:px-3">
+                  {allowImageAttachments && (
+                    <>
+                      <input ref={imageInputRef} type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" className="hidden" onChange={event => {
+                        selectImages(Array.from(event.currentTarget.files || []));
+                        event.currentTarget.value = "";
+                      }} multiple />
+                      <button type="button" onClick={() => imageInputRef.current?.click()} disabled={isProcessing || imageFiles.length >= MAX_TEST_IMAGES_PER_MESSAGE} aria-label="Attach image" title="Attach image" className="mb-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[#64748b] hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50">
+                        <Paperclip className="h-5 w-5" aria-hidden="true" />
+                      </button>
+                    </>
+                  )}
+                  <textarea rows={1} value={input} onChange={event => setInput(event.target.value)} onKeyDown={event => {
+                    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                      event.preventDefault();
+                      event.currentTarget.form?.requestSubmit();
+                    }
+                  }} disabled={isRecording || isProcessing} placeholder={isRecording ? "Listening..." : "Type a message"} aria-label="Type a message" className="max-h-32 min-h-12 min-w-0 flex-1 resize-y bg-transparent px-2 py-3 text-sm leading-5 text-[#172554] outline-none placeholder:text-[#64748b] disabled:cursor-not-allowed disabled:opacity-50" />
+                </div>
+                <button type="button" onClick={toggleRecording} disabled={isProcessing} aria-label={isRecording ? "Stop listening" : "Start speaking"} title={isRecording ? "Stop listening" : "Start speaking"} className={`mb-1 flex h-11 w-11 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${isRecording ? "bg-[#fee2e2] text-[#b91c1c]" : "bg-white text-[#1d4ed8] hover:bg-[#eff6ff]"}`}>
+                  {isRecording ? <StopCircle className="h-5 w-5" aria-hidden="true" /> : <Mic className="h-5 w-5" aria-hidden="true" />}
+                </button>
+                <button type="submit" disabled={(!input.trim() && imageFiles.length === 0) || isProcessing} aria-label="Send message" title="Send message" className="mb-1 flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-[#1d4ed8] text-white transition-colors hover:bg-[#1e40af] disabled:cursor-not-allowed disabled:opacity-40">
+                  <Send className="h-4 w-4" aria-hidden="true" />
+                </button>
+              </form>
+              {attachmentError && <p role="alert" className="mt-2 px-2 text-xs text-[#b91c1c]">{attachmentError}</p>}
+            </div>
+          </>
+        )}
+        
+
+        <div className="flex shrink-0 flex-col items-center gap-3 border-t border-[#d6d3d1] bg-[#f8fafc] px-4 py-4">
+          <p aria-live="polite" className="min-h-5 text-center text-sm text-[#475569]">
+            {recordingError || attachmentError || (sessionActive ? "Speak or type naturally to test your agent." : "Ready to begin.")}
+          </p>
+          {sessionActive && (
+            <div className="flex flex-wrap items-center justify-center gap-3">
+              <button type="button" onClick={reset} aria-label="Start a new test conversation" title="Start a new test conversation" className="flex h-10 items-center gap-2 rounded-full border border-[#fecaca] bg-[#fef2f2] px-4 text-sm font-medium text-[#b91c1c] transition-colors hover:bg-[#fee2e2]">
+                <X className="h-4 w-4" aria-hidden="true" />
+                New Conversation
               </button>
             </div>
-          </div>
-        )}
+          )}
+        </div>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+interface VoiceSelectionOption {
+  key: string;
+  providerId: string;
+  providerName: string;
+  model: string;
+  voice: string;
+}
+
+function VoiceSelectionStep({
+  form,
+  providerCatalog,
+  saving,
+  error,
+  onSelect,
+  onContinue,
+}: {
+  form: AgentForm;
+  providerCatalog: ProviderCatalog | null;
+  saving: boolean;
+  error: string;
+  onSelect: (option: VoiceSelectionOption) => void;
+  onContinue: () => void;
+}) {
+  const options = (providerCatalog?.tts || []).flatMap(provider =>
+    (provider.models || []).flatMap(model => (provider.voices || []).map(voice => ({
+      key: `${provider.id}::${model}::${voice}`,
+      providerId: provider.id,
+      providerName: provider.name,
+      model,
+      voice,
+    }))),
+  );
+  const selected = options.find(option =>
+    option.providerId === form.ttsProvider && option.model === form.ttsModel && option.voice === form.voice,
+  );
+
+  return (
+    <section className="space-y-5 rounded-xl border border-[rgba(99,102,241,0.18)] bg-[#0d1018] p-5 sm:p-7">
+      <div>
+        <h2 className="text-lg font-semibold text-[#e2e4ef]">Choose an agent voice</h2>
+        <p className="mt-1 text-sm text-[#8b8da3]">Select a voice supplied by the configured TTS providers.</p>
       </div>
-    </div>
+      {!providerCatalog ? (
+        <p className="text-sm text-[#8b8da3]" role="status">Loading supported voices...</p>
+      ) : options.length === 0 ? (
+        <p className="text-sm text-[#fca5a5]" role="alert">No configured TTS voices are currently available.</p>
+      ) : (
+        <div className="grid gap-3 sm:grid-cols-2">
+          {options.map(option => {
+            const isSelected = selected?.key === option.key;
+            return (
+              <button
+                key={option.key}
+                type="button"
+                onClick={() => onSelect(option)}
+                aria-pressed={isSelected}
+                className={cn(
+                  "flex items-start gap-3 rounded-lg border p-4 text-left transition-colors",
+                  isSelected
+                    ? "border-[#38bdf8] bg-[rgba(56,189,248,0.1)]"
+                    : "border-[rgba(99,102,241,0.18)] bg-[#111520] hover:border-[rgba(56,189,248,0.45)]",
+                )}
+              >
+                <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[rgba(56,189,248,0.14)] text-sm font-semibold text-[#7dd3fc]">
+                  {option.voice.slice(0, 1).toUpperCase()}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm font-medium text-[#e2e4ef]">{option.voice}</span>
+                  <span className="mt-1 block text-xs text-[#8b8da3]">{option.providerName} · {option.model}</span>
+                  <span className="mt-1 block text-xs text-[#636680]">Agent language: {form.language || "Not specified"}</span>
+                </span>
+                {isSelected && <Check className="h-4 w-4 shrink-0 text-[#38bdf8]" />}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      <p className="text-xs text-[#636680]">Voice preview is available in the tester after saving this choice.</p>
+      {error && <p role="alert" className="text-sm text-[#f87171]">{error}</p>}
+      <button
+        type="button"
+        onClick={onContinue}
+        disabled={!selected || saving}
+        className="rounded-md bg-[#0284c7] px-4 py-2 text-sm font-medium text-white hover:bg-[#0369a1] disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {saving ? "Saving voice..." : "Save voice and test agent"}
+      </button>
+    </section>
   );
 }
 
@@ -1886,27 +2084,42 @@ function VoiceAgentWorkspace({
   agent,
   profile: initialProfile,
   sessionId,
+  active,
   accessToken,
+  providerCatalog,
   onBack,
+  onReviewConversation,
   onSave,
+  onPublish,
 }: {
   agent: Agent;
   profile: BusinessProfile;
   sessionId: string;
+  active: boolean;
   accessToken: string;
+  providerCatalog: ProviderCatalog | null;
   onBack: () => void;
+  onReviewConversation: () => void;
   onSave: (
     sessionId: string,
     agent: Agent,
     form: AgentForm,
     profile: BusinessProfile,
   ) => Promise<{ agent: Agent; profile: BusinessProfile }>;
+  onPublish: (agent: Agent, form: AgentForm) => Promise<Agent>;
 }) {
   const [form, setForm] = useState(() => formFromAgent(agent));
   const [profile, setProfile] = useState(initialProfile);
+  const [stage, setStage] = useState<"voice-selection" | "testing">("voice-selection");
   const [reviewOpen, setReviewOpen] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [previewSaving, setPreviewSaving] = useState(false);
+  const [voicePreviewOpen, setVoicePreviewOpen] = useState(false);
   const [error, setError] = useState("");
+  const [publishing, setPublishing] = useState(false);
+  const [publishMessage, setPublishMessage] = useState("");
+  const [publishSucceeded, setPublishSucceeded] = useState(false);
+  const publishInFlightRef = useRef(false);
 
   const updateProfile = (field: typeof editableProfileFields[number], value: string) => {
     setProfile(current => ({
@@ -1936,6 +2149,133 @@ function VoiceAgentWorkspace({
     }
   };
 
+  const publishAgent = async () => {
+    if (publishInFlightRef.current || agent.status === "published") return;
+    publishInFlightRef.current = true;
+    setPublishing(true);
+    setPublishMessage("");
+    setPublishSucceeded(false);
+    try {
+      const publishedAgent = await onPublish(agent, form);
+      setForm(formFromAgent(publishedAgent));
+      setPublishMessage("Agent published and available in your agent list.");
+      setPublishSucceeded(true);
+    } catch (publishError) {
+      setPublishMessage(publishError instanceof Error ? publishError.message : "Agent could not be published.");
+    } finally {
+      publishInFlightRef.current = false;
+      setPublishing(false);
+    }
+  };
+
+  const republishAgent = async () => {
+    if (publishInFlightRef.current || agent.status !== "published") return;
+    publishInFlightRef.current = true;
+    setPublishing(true);
+    setPublishMessage("");
+    setPublishSucceeded(false);
+    setError("");
+    try {
+      const saved = await onSave(
+        sessionId,
+        agent,
+        { ...form, status: "published" },
+        profile,
+      );
+      if (saved.agent.id !== agent.id || saved.agent.status !== "published") {
+        throw new Error("The existing agent was not confirmed as updated and published.");
+      }
+      setForm(formFromAgent(saved.agent));
+      setProfile(saved.profile);
+      setPublishMessage("Agent republished with the reviewed configuration.");
+      setPublishSucceeded(true);
+    } catch (publishError) {
+      setPublishMessage(publishError instanceof Error ? publishError.message : "The reviewed agent could not be republished.");
+    } finally {
+      publishInFlightRef.current = false;
+      setPublishing(false);
+    }
+  };
+
+  const selectVoiceOption = (option: VoiceSelectionOption) => {
+    const sttProvider = providerCatalog?.stt.find(provider => provider.id === option.providerId);
+    setForm(current => ({
+      ...current,
+      ttsProvider: option.providerId,
+      ttsModel: option.model,
+      voice: option.voice,
+      ...(sttProvider ? {
+        sttProvider: sttProvider.id,
+        sttModel: sttProvider.models?.[0] || current.sttModel,
+      } : {}),
+    }));
+  };
+
+  const continueToTesting = async () => {
+    if (saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      const saved = await onSave(sessionId, agent, form, profile);
+      setForm(formFromAgent(saved.agent));
+      setProfile(saved.profile);
+      setStage("testing");
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : "The selected voice could not be saved.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const openVoicePreview = async () => {
+    if (previewSaving) return;
+    setPreviewSaving(true);
+    setError("");
+    try {
+      const saved = await onSave(sessionId, agent, form, profile);
+      setForm(formFromAgent(saved.agent));
+      setProfile(saved.profile);
+      setVoicePreviewOpen(true);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : "The agent configuration could not be saved for voice testing.");
+    } finally {
+      setPreviewSaving(false);
+    }
+  };
+
+  const voiceOptions = (providerCatalog?.tts || []).flatMap(provider =>
+    (provider.models || []).flatMap(model => (provider.voices || []).map(voice => ({
+      key: `${provider.id}::${model}::${voice}`,
+      provider,
+      model,
+      voice,
+    }))),
+  );
+  const selectedVoice = voiceOptions.find(option =>
+    option.provider.id === form.ttsProvider && option.model === form.ttsModel && option.voice === form.voice,
+  )?.key || "";
+
+  const selectVoice = (value: string) => {
+    const option = voiceOptions.find(candidate => candidate.key === value);
+    if (!option) return;
+    const sttProviders = providerCatalog?.stt || [];
+    const compatibleStt = sttProviders.find(provider => provider.id === option.provider.id);
+    const retainedStt = sttProviders.find(provider => provider.id === form.sttProvider);
+    const sttProvider = compatibleStt || retainedStt || sttProviders[0];
+    const sttModel = sttProvider
+      ? sttProvider.id === form.sttProvider && (sttProvider.models || []).includes(form.sttModel)
+        ? form.sttModel
+        : sttProvider.models?.[0] || form.sttModel
+      : form.sttModel;
+    setForm(current => ({
+      ...current,
+      ttsProvider: option.provider.id,
+      ttsModel: option.model,
+      voice: option.voice,
+      ...(sttProvider ? { sttProvider: sttProvider.id, sttModel } : {}),
+    }));
+  };
+
   return (
     <main className="min-h-screen bg-[#07090f] px-4 py-8 sm:px-6">
       <div className="mx-auto max-w-4xl">
@@ -1949,19 +2289,50 @@ function VoiceAgentWorkspace({
           </button>
           <div className="min-w-0 flex-1">
             <h1 className="truncate text-xl font-semibold text-[#e2e4ef]">{agent.name}</h1>
-            <p className="text-xs text-[#8b8da3]">Agent testing</p>
+            <p className="text-xs text-[#8b8da3]">{stage === "voice-selection" ? "Choose a voice" : "Agent testing"}</p>
           </div>
           <StatusBadge status={agent.status} />
+          <button
+            type="button"
+            onClick={onReviewConversation}
+            className="rounded-md border border-[rgba(99,102,241,0.2)] px-3 py-2 text-sm text-[#b4b8cc] hover:text-white"
+          >
+            Review
+          </button>
+          {stage === "testing" && (
+            <>
+              <button
+                type="button"
+                onClick={() => setStage("voice-selection")}
+                className="rounded-md border border-[rgba(56,189,248,0.35)] px-3 py-2 text-sm text-[#7dd3fc] hover:bg-[rgba(56,189,248,0.1)]"
+              >
+                Change Voice
+              </button>
+              <button
+                type="button"
+                onClick={() => void publishAgent()}
+                disabled={publishing || agent.status === "published"}
+                className="rounded-md bg-[#16a34a] px-4 py-2 text-sm font-medium text-white hover:bg-[#15803d] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {publishing ? "Publishing..." : agent.status === "published" ? "Published" : "Publish Agent"}
+              </button>
+            </>
+          )}
           <button
             type="button"
             onClick={() => { setError(""); setReviewOpen(value => !value); }}
             className="rounded-md bg-[#7357e8] px-4 py-2 text-sm font-medium text-white hover:bg-[#6448d5]"
           >
-            {reviewOpen ? "Back to testing" : "Review Information"}
+            {reviewOpen ? "Back to testing" : "Edit Configuration"}
           </button>
         </header>
 
         {error && <p role="alert" className="mb-4 text-sm text-[#f87171]">{error}</p>}
+        {publishMessage && (
+          <p role={publishSucceeded ? "status" : "alert"} className={`mb-4 text-sm ${publishSucceeded ? "text-[#4ade80]" : "text-[#f87171]"}`}>
+            {publishMessage}
+          </p>
+        )}
         {reviewOpen ? (
           <section className="space-y-6 rounded-xl border border-[rgba(99,102,241,0.18)] bg-[#0d1018] p-5 sm:p-7">
             <div>
@@ -2015,19 +2386,78 @@ function VoiceAgentWorkspace({
                     />
                   </label>
                 ))}
+                <label className="text-xs text-[#a0a3b8]">
+                  Agent voice
+                  <select
+                    value={selectedVoice}
+                    onChange={event => selectVoice(event.target.value)}
+                    disabled={!providerCatalog || voiceOptions.length === 0}
+                    className="mt-1 block w-full rounded-md border border-[rgba(99,102,241,0.18)] bg-[#111520] px-3 py-2 text-sm text-[#d5d7e2] outline-none focus:ring-1 focus:ring-[#6366f1] disabled:opacity-60"
+                  >
+                    <option value="">{providerCatalog ? "Choose a provider voice" : "Loading available voices..."}</option>
+                    {voiceOptions.map(option => (
+                      <option key={option.key} value={option.key}>
+                        {option.provider.name} · {option.model} · {option.voice}
+                      </option>
+                    ))}
+                  </select>
+                </label>
               </div>
             </div>
-            <button
-              type="button"
-              onClick={() => void saveReview()}
-              disabled={saving}
-              className="rounded-md bg-[#7357e8] px-4 py-2 text-sm font-medium text-white hover:bg-[#6448d5] disabled:opacity-50"
-            >
-              {saving ? "Saving changes..." : "Save changes"}
-            </button>
+            <div className="flex flex-wrap gap-3">
+              <button
+                type="button"
+                onClick={() => void saveReview()}
+                disabled={saving || publishing}
+                className="rounded-md bg-[#7357e8] px-4 py-2 text-sm font-medium text-white hover:bg-[#6448d5] disabled:opacity-50"
+              >
+                {saving ? "Saving changes..." : "Save changes"}
+              </button>
+              {agent.status === "published" && (
+                <button
+                  type="button"
+                  onClick={() => void republishAgent()}
+                  disabled={saving || publishing}
+                  className="rounded-md bg-[#16a34a] px-4 py-2 text-sm font-medium text-white hover:bg-[#15803d] disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {publishing ? "Republishing..." : "Republish Agent"}
+                </button>
+              )}
+            </div>
           </section>
+        ) : stage === "voice-selection" ? (
+          <VoiceSelectionStep
+            form={form}
+            providerCatalog={providerCatalog}
+            saving={saving}
+            error={error}
+            onSelect={selectVoiceOption}
+            onContinue={() => void continueToTesting()}
+          />
         ) : (
-          <TestStep form={form} agentId={agent.id} accessToken={accessToken} showConfiguredGreeting={false} />
+          <>
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+              <p className="text-sm text-[#8b8da3]">Text, image, and voice testing use the saved agent configuration.</p>
+              <button
+                type="button"
+                onClick={() => void openVoicePreview()}
+                disabled={previewSaving}
+                className="flex items-center gap-2 rounded-md bg-[#0284c7] px-3 py-2 text-sm font-medium text-white hover:bg-[#0369a1] disabled:opacity-50"
+              >
+                <Volume2 className="h-4 w-4" />
+                {previewSaving ? "Saving..." : "Test Voice Conversation"}
+              </button>
+            </div>
+            {error && <p role="alert" className="mb-3 text-sm text-[#f87171]">{error}</p>}
+            <TestStep form={form} agentId={agent.id} accessToken={accessToken} showConfiguredGreeting={false} allowImageAttachments active={active} />
+            {voicePreviewOpen && (
+              <UseAgentModal
+                agent={{ ...agent, ...form }}
+                accessToken={accessToken}
+                onClose={() => setVoicePreviewOpen(false)}
+              />
+            )}
+          </>
         )}
       </div>
     </main>
@@ -2169,7 +2599,7 @@ function AgentWizard({ initialForm, accessToken, onboardingSessionId, onBack, on
     <ToolsStep key={5} form={form} onChange={onChange} />,
     <MemoryStep key={6} form={form} onChange={onChange} />,
     <SecurityStep key={7} form={form} onChange={onChange} onGenerate={() => setPromptGeneratorOpen(true)} />,
-    <TestStep key={8} form={form} agentId={currentAgentId} accessToken={accessToken} />,
+    <TestStep key={8} form={form} agentId={currentAgentId} accessToken={accessToken} allowImageAttachments={isEditing} />,
     <PublishStep key={9} form={form} onPublish={handlePublish} onSaveDraft={() => void handleSave("draft")} />,
   ];
 
@@ -2331,8 +2761,13 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
   const [callError, setCallError] = useState("");
   const [messages, setMessages] = useState<TestMessage[]>([]);
   const [processing, setProcessing] = useState(false);
+  const [chatSending, setChatSending] = useState(false);
+  const [chatInput, setChatInput] = useState("");
+  const [chatImages, setChatImages] = useState<TestImageAttachment[]>([]);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatImageInputRef = useRef<HTMLInputElement>(null);
+  const chatImagePreviewUrlsRef = useRef(new Set<string>());
   const socketRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const nextAudioTimeRef = useRef(0);
@@ -2346,6 +2781,9 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
   const micProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const backendReadyRef = useRef(false);
   const micCallbackCountRef = useRef(0);
+  const sessionStartedAtRef = useRef(0);
+  const callStartedAtRef = useRef(0);
+  const firstAudioReceivedRef = useRef(false);
   const voiceDiag = (event: string, details: Record<string, unknown> = {}) => {
     console.info(`[${new Date().toISOString()}] [VOICE DIAG] ${event}`, details);
   };
@@ -2446,11 +2884,18 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
   }, [callActive]);
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+  useEffect(() => () => {
+    for (const previewUrl of chatImagePreviewUrlsRef.current) URL.revokeObjectURL(previewUrl);
+    chatImagePreviewUrlsRef.current.clear();
+  }, []);
 
   const formatDuration = (s: number) => `${Math.floor(s / 60).toString().padStart(2, "0")}:${(s % 60).toString().padStart(2, "0")}`;
 
   const startCall = () => {
     backendReadyRef.current = false;
+    sessionStartedAtRef.current = performance.now();
+    callStartedAtRef.current = sessionStartedAtRef.current;
+    firstAudioReceivedRef.current = false;
     setCallError("");
     setCallActive(true);
     setMessages([]);
@@ -2482,11 +2927,6 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
     socketRef.current = socket;
     socket.binaryType = "arraybuffer";
     socket.onmessage = event => {
-      console.log("[BROWSER AUDIO] MESSAGE RECEIVED", {
-        type: typeof event.data,
-        isArrayBuffer: event.data instanceof ArrayBuffer,
-        byteLength: event.data instanceof ArrayBuffer ? event.data.byteLength : undefined,
-      });
       if (event.data instanceof ArrayBuffer) {
         try {
           if (event.data.byteLength < 4) return;
@@ -2502,49 +2942,19 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
             });
             return;
           }
-          console.log("[AUDIO DEBUG] binary audio chunk received", {
-            byteLength: event.data.byteLength - 4,
-            activeSources: audioSourcesRef.current.size,
-            playbackGeneration: playbackGenerationRef.current,
-            acceptingAudio: acceptingAudioRef.current,
-          });
           const playbackGeneration = frameGeneration;
           const context = audioContextRef.current;
           if (!context) return;
-          console.log("[BROWSER AUDIO] AUDIOCONTEXT", {
-            state: context.state,
-            currentTime: context.currentTime,
-            sampleRate: context.sampleRate,
-          });
-          console.log(`[BROWSER AUDIO] websocket binary received bytes=${event.data.byteLength - 4}`);
-          console.log(`[BROWSER AUDIO] decoding PCM bytes=${event.data.byteLength - 4}`);
-          console.log(`[AUDIO] browser audio chunk received bytes=${event.data.byteLength - 4}`);
-          const samples = new Int16Array(event.data, 4);
-          let minimumSample = 0;
-          let maximumSample = 0;
-          if (samples.length > 0) {
-            minimumSample = samples[0];
-            maximumSample = samples[0];
-            for (let index = 1; index < samples.length; index += 1) {
-              minimumSample = Math.min(minimumSample, samples[index]);
-              maximumSample = Math.max(maximumSample, samples[index]);
-            }
+          if (!firstAudioReceivedRef.current) {
+            firstAudioReceivedRef.current = true;
+            voiceDiag("first audio chunk received", {
+              elapsedMs: Math.round(performance.now() - callStartedAtRef.current),
+              byteLength: event.data.byteLength - 4,
+              generation: playbackGeneration,
+            });
           }
-          console.log("[BROWSER AUDIO] PCM INPUT", {
-            byteLength: event.data.byteLength,
-            sampleCount: samples.length,
-            firstSample: samples[0],
-            minimumSample,
-            maximumSample,
-            allZeroSamples: minimumSample === 0 && maximumSample === 0,
-          });
+          const samples = new Int16Array(event.data, 4);
           const audioBuffer = context.createBuffer(1, samples.length, 16000);
-          console.log("[BROWSER AUDIO] AUDIOBUFFER CREATED", {
-            channels: audioBuffer.numberOfChannels,
-            length: audioBuffer.length,
-            sampleRate: audioBuffer.sampleRate,
-            duration: audioBuffer.duration,
-          });
           const channel = audioBuffer.getChannelData(0);
           for (let index = 0; index < samples.length; index += 1) {
             channel[index] = samples[index] / 32768;
@@ -2558,42 +2968,14 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
             return;
           }
           const source = context.createBufferSource();
-          console.log("[AUDIO DEBUG] AudioBufferSourceNode created", {
-            playbackGeneration,
-            activeSources: audioSourcesRef.current.size,
-          });
           source.buffer = audioBuffer;
           source.connect(context.destination);
           source.onended = () => {
             audioSourcesRef.current.delete(source);
-            console.log("[AUDIO DEBUG] AudioBufferSourceNode naturally finished", {
-              activeSourcesRemaining: audioSourcesRef.current.size,
-              playbackGeneration: playbackGenerationRef.current,
-            });
-            console.log("[BROWSER AUDIO] SOURCE ENDED");
             sendPlaybackCompleteIfReady(playbackGeneration);
           };
           audioSourcesRef.current.add(source);
-          console.log("[AUDIO DEBUG] source added to tracked collection", {
-            activeSources: audioSourcesRef.current.size,
-            playbackGeneration,
-          });
           const startTime = Math.max(context.currentTime, nextAudioTimeRef.current);
-          console.log("[AUDIO DEBUG] binary audio chunk about to be scheduled", {
-            playbackGeneration,
-            currentGeneration: playbackGenerationRef.current,
-            activeSources: audioSourcesRef.current.size,
-            startTime,
-          });
-          console.log("[BROWSER AUDIO] PLAYBACK SCHEDULE", {
-            contextCurrentTime: context.currentTime,
-            nextAudioTime: nextAudioTimeRef.current,
-            startTime,
-            scheduledDelay: startTime - context.currentTime,
-            bufferDuration: audioBuffer.duration,
-            contextState: context.state,
-          });
-          console.log("[BROWSER AUDIO] SOURCE STARTING");
           try {
             source.start(startTime);
           } catch (error) {
@@ -2602,9 +2984,7 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
             sendPlaybackCompleteIfReady(playbackGeneration);
             throw error;
           }
-          console.log("[BROWSER AUDIO] SOURCE START CALLED");
           nextAudioTimeRef.current = startTime + audioBuffer.duration;
-          console.log("[AUDIO] browser playback started");
         } catch (error) {
           console.error("[BROWSER AUDIO] PLAYBACK ERROR", error);
         }
@@ -2629,20 +3009,46 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
         stopScheduledAudio();
         return;
       }
+      if (message.event === "assistant_start") {
+        if (message.data.generation < playbackGenerationRef.current) return;
+        playbackGenerationRef.current = message.data.generation;
+        ttsCompleteGenerationRef.current = null;
+        playbackCompleteSentRef.current = false;
+        acceptingAudioRef.current = true;
+        nextAudioTimeRef.current = audioContextRef.current?.currentTime || 0;
+        return;
+      }
       if (message.event === "transcript") {
-        setIsListening(false);
+        callStartedAtRef.current = performance.now();
+        firstAudioReceivedRef.current = false;
         setProcessing(true);
-        setMessages(prev => [...prev, { id: `${Date.now()}-user`, role: "user", content: message.data.text, timestamp: new Date().toLocaleTimeString() }]);
+        setMessages(prev => [...prev.filter(item => item.id !== "voice-interim"), { id: `${Date.now()}-user`, role: "user", content: message.data.text, timestamp: new Date().toLocaleTimeString() }]);
+      }
+      if (message.event === "interim_transcript") {
+        setMessages(prev => {
+          const interimMessage: TestMessage = {
+            id: "voice-interim",
+            role: "user",
+            content: message.data.text,
+            timestamp: new Date().toLocaleTimeString(),
+            interim: true,
+          };
+          return prev.some(item => item.id === interimMessage.id)
+            ? prev.map(item => item.id === interimMessage.id ? interimMessage : item)
+            : [...prev, interimMessage];
+        });
       }
       if (message.event === "assistant") {
         if (message.data.generation < playbackGenerationRef.current) return;
         playbackGenerationRef.current = message.data.generation;
         ttsCompleteGenerationRef.current = null;
         playbackCompleteSentRef.current = false;
-        audioSourcesRef.current.clear();
         acceptingAudioRef.current = true;
         setProcessing(false);
         setMessages(prev => [...prev, { id: `${Date.now()}-agent`, role: "agent", content: message.data.text, timestamp: new Date().toLocaleTimeString() }]);
+      }
+      if (message.event === "error") {
+        setCallError(message.data?.message || "The voice session encountered an error.");
       }
       if (message.event === "tts_complete") {
         ttsCompleteGenerationRef.current = message.data.generation;
@@ -2650,11 +3056,17 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
       }
       if (message.event === "ready") {
         backendReadyRef.current = true;
-        voiceDiag("owner preview runtime ready", { readyState: socket.readyState });
+        voiceDiag("owner preview runtime ready", {
+          readyState: socket.readyState,
+          elapsedMs: Math.round(performance.now() - sessionStartedAtRef.current),
+        });
       }
     };
     socket.onopen = () => {
-      voiceDiag("owner preview WebSocket connected", { readyState: socket.readyState });
+      voiceDiag("owner preview WebSocket connected", {
+        readyState: socket.readyState,
+        elapsedMs: Math.round(performance.now() - sessionStartedAtRef.current),
+      });
     };
     socket.onclose = event => {
       backendReadyRef.current = false;
@@ -2728,6 +3140,88 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
     socketRef.current = null;
     void audioContextRef.current?.close();
     audioContextRef.current = null;
+  };
+
+  const selectChatImages = (files: File[]) => {
+    const additions: TestImageAttachment[] = [];
+    let error = "";
+    for (const file of files) {
+      if (chatImages.length + additions.length >= MAX_TEST_IMAGES_PER_MESSAGE) {
+        error = `Attach up to ${MAX_TEST_IMAGES_PER_MESSAGE} images per message.`;
+        break;
+      }
+      if (!TEST_IMAGE_TYPES.has(file.type)) {
+        error = "Choose PNG, JPEG, or WebP images.";
+        continue;
+      }
+      if (file.size > MAX_TEST_IMAGE_SIZE_BYTES) {
+        error = "Each image must be 8 MB or smaller.";
+        continue;
+      }
+      const previewUrl = URL.createObjectURL(file);
+      chatImagePreviewUrlsRef.current.add(previewUrl);
+      additions.push({ file, previewUrl });
+    }
+    if (error) setCallError(error);
+    else setCallError("");
+    if (additions.length) setChatImages(current => [...current, ...additions]);
+  };
+
+  const removeChatImage = (previewUrl: string) => {
+    URL.revokeObjectURL(previewUrl);
+    chatImagePreviewUrlsRef.current.delete(previewUrl);
+    setChatImages(current => current.filter(image => image.previewUrl !== previewUrl));
+  };
+
+  const sendChatMessage = async () => {
+    if ((!chatInput.trim() && chatImages.length === 0) || chatSending || processing || isListening) return;
+    const text = chatInput.trim() || "Please describe the attached image.";
+    const selectedImages = [...chatImages];
+    const history = chatHistoryFromTranscript(messages);
+    setMessages(prev => [...prev, {
+      id: `${Date.now()}-user`,
+      role: "user",
+      content: text,
+      timestamp: new Date().toLocaleTimeString(),
+      images: selectedImages.map(({ file, previewUrl }) => ({ name: file.name, previewUrl })),
+    }]);
+    setChatInput("");
+    setChatImages([]);
+    setCallError("");
+    setChatSending(true);
+
+    try {
+      const data = await apiRequest("/chat", {
+        method: "POST",
+        accessToken,
+        body: JSON.stringify({
+          agent_id: agent.id,
+          message: text,
+          history,
+          images: await Promise.all(selectedImages.map(async ({ file }) => ({
+            mime_type: file.type,
+            data: await fileToBase64(file),
+          }))),
+        }),
+      });
+      setMessages(prev => [...prev, {
+        id: `${Date.now()}-agent`,
+        role: "agent",
+        content: data.response,
+        timestamp: new Date().toLocaleTimeString(),
+      }]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Chat request failed.";
+      setCallError(message);
+      setMessages(prev => [...prev, {
+        id: `${Date.now()}-error`,
+        role: "agent",
+        content: message,
+        timestamp: new Date().toLocaleTimeString(),
+      }]);
+    } finally {
+      setChatSending(false);
+    }
   };
 
   const handleMic = async () => {
@@ -2877,7 +3371,7 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
   };
 
   const buildTranscriptText = useCallback(() => {
-    const transcriptMessages = messages.filter(msg => msg.content && msg.content.trim().length > 0);
+    const transcriptMessages = messages.filter(msg => !msg.interim && msg.content && msg.content.trim().length > 0);
 
     if (transcriptMessages.length === 0) {
       return null;
@@ -2974,10 +3468,23 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
                     msg.role === "user" ? "bg-[#1a2030] text-[#b4b8cc]" : "bg-[rgba(99,102,241,0.1)] text-[#e2e4ef] border border-[rgba(99,102,241,0.15)]"
                   )}>
                     {msg.content}
+                    {msg.images && msg.images.length > 0 && (
+                      <div className="mt-2 grid grid-cols-2 gap-2">
+                        {msg.images.map(image => (
+                          <img
+                            key={image.previewUrl}
+                            src={image.previewUrl}
+                            alt={`Attached image: ${image.name}`}
+                            title={image.name}
+                            className="max-h-28 max-w-full rounded-md object-contain"
+                          />
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}
-              {(processing || isListening) && (
+              {(processing || isListening || chatSending) && (
                 <div className="flex gap-2">
                   <div className="w-6 h-6 rounded-full bg-[rgba(99,102,241,0.2)] flex items-center justify-center flex-shrink-0">
                     <Bot className="w-3 h-3 text-[#6366f1]" />
@@ -3002,36 +3509,107 @@ function UseAgentModal({ agent, accessToken, onClose }: { agent: Agent; accessTo
               <Phone className="w-4 h-4" /> Start Conversation
             </button>
           ) : (
-            <div className="flex items-center justify-between gap-2">
-              <button onClick={endCall}
-                className="w-12 h-12 rounded-full bg-[#ef4444] text-white flex items-center justify-center hover:bg-[#dc2626] transition-colors">
-                <StopCircle className="w-5 h-5" />
-              </button>
-              <button
-                onClick={handleDownloadTranscript}
-                className="flex items-center justify-center gap-2 px-3 py-2.5 bg-[#171d2e] border border-[rgba(99,102,241,0.2)] text-[#b4b8cc] text-[11px] font-medium rounded-xl hover:border-[rgba(99,102,241,0.4)] transition-colors"
+            <>
+              <form
+                onSubmit={event => { event.preventDefault(); void sendChatMessage(); }}
+                className="mb-3 space-y-2"
               >
-                <Download className="w-3.5 h-3.5" />
-                Download Transcript
-              </button>
-              <button
-                onClick={handleMic}
-                disabled={isListening || processing}
-                className={cn(
-                  "w-16 h-16 rounded-full flex items-center justify-center transition-all shadow-lg",
-                  isListening
-                    ? "bg-[#ef4444] animate-pulse shadow-[rgba(239,68,68,0.4)]"
-                    : processing
-                    ? "bg-[#374151] text-[#636680] cursor-not-allowed"
-                    : "bg-[#6366f1] text-white hover:bg-[#4f46e5] shadow-[rgba(99,102,241,0.4)]"
+                <input
+                  ref={chatImageInputRef}
+                  type="file"
+                  accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp"
+                  multiple
+                  className="hidden"
+                  onChange={event => {
+                    selectChatImages(Array.from(event.currentTarget.files || []));
+                    event.currentTarget.value = "";
+                  }}
+                />
+                {chatImages.length > 0 && (
+                  <div className="flex flex-wrap gap-2">
+                    {chatImages.map(image => (
+                      <div key={image.previewUrl} className="relative h-14 w-14">
+                        <img src={image.previewUrl} alt={`Preview: ${image.file.name}`} className="h-full w-full rounded-md object-cover" />
+                        <button
+                          type="button"
+                          onClick={() => removeChatImage(image.previewUrl)}
+                          aria-label={`Remove ${image.file.name}`}
+                          title="Remove image"
+                          className="absolute -right-1 -top-1 flex h-5 w-5 items-center justify-center rounded-full bg-[#1a2030] text-white"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 )}
-              >
-                {isListening ? <Mic className="w-6 h-6 text-white" /> : <Mic className="w-6 h-6" />}
-              </button>
-              <div className="w-12 h-12 rounded-full bg-[#1a2030] flex items-center justify-center">
-                <Volume2 className="w-4 h-4 text-[#636680]" />
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => chatImageInputRef.current?.click()}
+                    disabled={chatSending || processing || isListening || chatImages.length >= MAX_TEST_IMAGES_PER_MESSAGE}
+                    aria-label="Attach images"
+                    title="Attach images"
+                    className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[rgba(99,102,241,0.15)] text-[#a5a8ff] hover:bg-[rgba(99,102,241,0.25)] disabled:opacity-40"
+                  >
+                    <Upload className="h-4 w-4" />
+                  </button>
+                  <input
+                    value={chatInput}
+                    onChange={event => setChatInput(event.target.value)}
+                    onKeyDown={event => {
+                      if (event.key === "Enter" && !event.shiftKey) {
+                        event.preventDefault();
+                        void sendChatMessage();
+                      }
+                    }}
+                    disabled={chatSending || processing || isListening}
+                    placeholder="Type a message or attach images..."
+                    aria-label="Message the agent"
+                    className="min-w-0 flex-1 rounded-lg border border-[rgba(99,102,241,0.2)] bg-[#111520] px-3 py-2.5 text-sm text-[#e2e4ef] placeholder:text-[#636680] outline-none focus:border-[#6366f1] focus:ring-1 focus:ring-[#6366f1] disabled:opacity-50"
+                  />
+                  <button
+                    type="submit"
+                    disabled={(!chatInput.trim() && chatImages.length === 0) || chatSending || processing || isListening}
+                    aria-label="Send message"
+                    title="Send message"
+                    className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[#6366f1] text-white hover:bg-[#4f46e5] disabled:opacity-40"
+                  >
+                    <Send className="h-4 w-4" />
+                  </button>
+                </div>
+              </form>
+              <div className="flex items-center justify-between gap-2">
+                <button onClick={endCall}
+                  className="w-12 h-12 rounded-full bg-[#ef4444] text-white flex items-center justify-center hover:bg-[#dc2626] transition-colors">
+                  <StopCircle className="w-5 h-5" />
+                </button>
+                <button
+                  onClick={handleDownloadTranscript}
+                  className="flex items-center justify-center gap-2 px-3 py-2.5 bg-[#171d2e] border border-[rgba(99,102,241,0.2)] text-[#b4b8cc] text-[11px] font-medium rounded-xl hover:border-[rgba(99,102,241,0.4)] transition-colors"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Download Transcript
+                </button>
+                <button
+                  onClick={handleMic}
+                  disabled={isListening || processing || chatSending}
+                  className={cn(
+                    "w-16 h-16 rounded-full flex items-center justify-center transition-all shadow-lg",
+                    isListening
+                      ? "bg-[#ef4444] animate-pulse shadow-[rgba(239,68,68,0.4)]"
+                      : processing || chatSending
+                      ? "bg-[#374151] text-[#636680] cursor-not-allowed"
+                      : "bg-[#6366f1] text-white hover:bg-[#4f46e5] shadow-[rgba(99,102,241,0.4)]"
+                  )}
+                >
+                  {isListening ? <Mic className="w-6 h-6 text-white" /> : <Mic className="w-6 h-6" />}
+                </button>
+                <div className="w-12 h-12 rounded-full bg-[#1a2030] flex items-center justify-center">
+                  <Volume2 className="w-4 h-4 text-[#636680]" />
+                </div>
               </div>
-            </div>
+            </>
           )}
         </div>
       </div>
@@ -3333,9 +3911,10 @@ export default function App() {
   const [view, setView] = useState<View>("dashboard");
   const [createModeOpen, setCreateModeOpen] = useState(false);
   const [agents, setAgents] = useState<Agent[]>([]);
-  const [, setProviderCatalogVersion] = useState(0);
+  const [providerCatalog, setProviderCatalog] = useState<ProviderCatalog | null>(null);
   const [editingAgent, setEditingAgent] = useState<Agent | null>(null);
   const [onboardingDraft, setOnboardingDraft] = useState<{ sessionId: string; fields: AgentFields } | null>(null);
+  const [onboardingReviewSessionId, setOnboardingReviewSessionId] = useState<string | null>(null);
   const [voiceAgentContext, setVoiceAgentContext] = useState<{
     sessionId: string;
     agent: Agent;
@@ -3378,8 +3957,8 @@ export default function App() {
     apiRequest("/providers")
       .then(data => {
         if (!mounted) return;
+        setProviderCatalog(data);
         applyProviderCatalog(data);
-        setProviderCatalogVersion(version => version + 1);
       })
       .catch(error => {
         console.error("Failed to load providers:", error);
@@ -3457,18 +4036,28 @@ if (!session) {
     setCreateModeOpen(false);
     setEditingAgent(null);
     setOnboardingDraft(null);
+    setOnboardingReviewSessionId(null);
     setView("wizard");
   };
 
   const handleCreateVoiceAgent = () => {
     setCreateModeOpen(false);
-    setVoiceAgentContext(null);
+    setEditingAgent(null);
+    setOnboardingDraft(null);
+    setOnboardingReviewSessionId(null);
     setView("voice-onboarding");
   };
 
   const handleEditAgent = (agent: Agent) => {
-    setEditingAgent(agent);
     setOnboardingDraft(null);
+    if (agent.onboarding_session_id) {
+      setEditingAgent(null);
+      setOnboardingReviewSessionId(agent.onboarding_session_id);
+      setView("voice-onboarding");
+      return;
+    }
+    setOnboardingReviewSessionId(null);
+    setEditingAgent(agent);
     setView("wizard");
   };
 
@@ -3536,7 +4125,16 @@ if (!session) {
         ...existingForm,
         name: fields.name || existingForm.name,
         description: fields.description || existingForm.description,
+        purpose: fields.purpose || existingForm.purpose,
+        goals: fields.goals || existingForm.goals,
+        tone: fields.tone || existingForm.tone,
+        language: fields.language || existingForm.language,
         businessContext: fields.businessContext || existingForm.businessContext,
+        systemInstructions: fields.systemInstructions || existingForm.systemInstructions,
+        allowedTopics: fields.allowedTopics || existingForm.allowedTopics,
+        restrictedTopics: fields.restrictedTopics || existingForm.restrictedTopics,
+        escalationRules: fields.escalationRules || existingForm.escalationRules,
+        humanHandoffConditions: fields.humanHandoffConditions || existingForm.humanHandoffConditions,
       }, undefined, associatedAgentId);
     } else {
       const initialForm = voiceAgentForm(fields);
@@ -3585,6 +4183,16 @@ if (!session) {
       ? { ...current, agent: savedAgent, profile: reviewed.profile }
       : current);
     return { agent: savedAgent, profile: reviewed.profile };
+  };
+
+  const handlePublishVoiceAgent = async (agent: Agent, form: AgentForm) => {
+    const publishedAgent = await handleSaveAgent({ ...form, status: "published" }, undefined, agent.id);
+    if (publishedAgent.status !== "published") {
+      throw new Error("The backend did not confirm that this agent was published.");
+    }
+    setVoiceAgentContext(current => current ? { ...current, agent: publishedAgent } : current);
+    setView("dashboard");
+    return publishedAgent;
   };
 
   const handleDuplicateAgent = async (agent: Agent) => {
@@ -3657,7 +4265,7 @@ if (!session) {
               { label: "Templates", view: null },
               { label: "Analytics", view: null },
               { label: "Docs", view: null },
-              { label: "Voice Mode", view: "voice-onboarding" as const },
+  
             ].map(item => (
               <button key={item.label}
                 className={cn(
@@ -3733,19 +4341,29 @@ if (!session) {
       )}
 
       <div className={view === "voice-onboarding" ? "" : "hidden"} aria-hidden={view !== "voice-onboarding"}>
-        <VoiceOnboarding active={view === "voice-onboarding"} onCreateAgent={handleOnboardingAgent} />
+        <VoiceOnboarding
+          active={view === "voice-onboarding"}
+          resumeSessionId={onboardingReviewSessionId}
+          onCreateAgent={handleOnboardingAgent}
+        />
       </div>
 
-      {view === "voice-test" && voiceAgentContext && (
-        <VoiceAgentWorkspace
-          key={voiceAgentContext.agent.id}
-          sessionId={voiceAgentContext.sessionId}
-          agent={voiceAgentContext.agent}
-          profile={voiceAgentContext.profile}
-          accessToken={session.access_token}
-          onBack={() => setView("dashboard")}
-          onSave={handleSaveVoiceReview}
-        />
+      {voiceAgentContext && (
+        <div className={view === "voice-test" ? "" : "hidden"} aria-hidden={view !== "voice-test"}>
+          <VoiceAgentWorkspace
+            key={`${voiceAgentContext.sessionId}:${voiceAgentContext.agent.id}`}
+            sessionId={voiceAgentContext.sessionId}
+            active={view === "voice-test"}
+            agent={voiceAgentContext.agent}
+            profile={voiceAgentContext.profile}
+            accessToken={session.access_token}
+            providerCatalog={providerCatalog}
+            onBack={() => setView("dashboard")}
+            onReviewConversation={() => setView("voice-onboarding")}
+            onSave={handleSaveVoiceReview}
+            onPublish={handlePublishVoiceAgent}
+          />
+        </div>
       )}
 
       {view === "wizard" && (
