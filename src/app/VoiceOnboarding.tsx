@@ -23,6 +23,33 @@ export interface BusinessProfile {
   conflicts: Array<{ field: string; statement: string; quote: string; source: string }>;
 }
 
+export const editableProfileFields = [
+  "business_name",
+  "description",
+  "industry",
+  "location",
+  "brands",
+  "products_services",
+  "target_customers",
+  "customer_needs",
+  "agent_purpose",
+  "agent_responsibilities",
+  "communication_tone",
+  "language",
+  "business_rules",
+] as const satisfies readonly (keyof BusinessProfile)[];
+
+type EditableProfileField = typeof editableProfileFields[number];
+
+export const listProfileFields: ReadonlySet<EditableProfileField> = new Set([
+  "brands",
+  "products_services",
+  "target_customers",
+  "customer_needs",
+  "agent_responsibilities",
+  "business_rules",
+]);
+
 export interface AgentFields {
   name: string;
   description: string;
@@ -39,7 +66,7 @@ export interface AgentFields {
 }
 
 type TranscriptTurn = string | { role: "user" | "assistant"; content: string; sent_at?: string };
-type ConversationMessage = { role: "user" | "assistant"; content: string; sentAt?: string };
+type ConversationMessage = { role: "user" | "assistant" | "system"; content: string; sentAt?: string };
 type UploadedDocument = { id: string; filename: string; processed: boolean };
 
 const MAX_DOCUMENT_SIZE_BYTES = 2 * 1024 * 1024;
@@ -98,16 +125,6 @@ type SpeechRecognitionWindow = Window & {
 };
 
 const greeting = "Hi! What would you like your agent to do?";
-export const editableProfileFields = [
-  "business_name", "description", "industry", "location", "brands", "products_services",
-  "target_customers", "customer_needs", "agent_purpose", "agent_responsibilities",
-  "communication_tone", "language", "business_rules",
-] as const;
-export const listProfileFields = new Set<string>([
-  "brands", "products_services", "target_customers", "customer_needs",
-  "agent_responsibilities", "business_rules",
-]);
-
 function getRecognitionConstructor(): SpeechRecognitionConstructor | null {
   if (typeof window === "undefined") return null;
   const speechWindow = window as SpeechRecognitionWindow;
@@ -136,9 +153,8 @@ export default function VoiceOnboarding({
   const [completionRecorded, setCompletionRecorded] = useState(false);
   const [research, setResearch] = useState<ResearchJob[]>([]);
   const [associatedAgentId, setAssociatedAgentId] = useState<string | null>(null);
-  const [isSavingReview, setIsSavingReview] = useState(false);
+  const [isCreatingAgent, setIsCreatingAgent] = useState(false);
   const [isUploadingDocument, setIsUploadingDocument] = useState(false);
-  const [profileDirty, setProfileDirty] = useState(false);
   const [voiceMessage, setVoiceMessage] = useState("");
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const documentInputRef = useRef<HTMLInputElement | null>(null);
@@ -190,6 +206,11 @@ export default function VoiceOnboarding({
     modeEpochRef.current += 1;
     stopVoicePlayback();
     setMode(nextMode);
+    setConversationMessages(current => [...current, {
+      role: "system",
+      content: nextMode === "chat" ? "Switched to chat mode" : "Switched to voice mode",
+      sentAt: new Date().toISOString(),
+    }]);
   };
 
   const speakWithBrowser = (text: string, generation: number) => {
@@ -313,26 +334,29 @@ export default function VoiceOnboarding({
   const beginOnboarding = async () => {
     if (sessionStartInFlightRef.current || sessionId) return;
     sessionStartInFlightRef.current = true;
-    const clickedAt = performance.now();
+    const startedAt = performance.now();
     setConsented(true);
     setIsStarting(true);
     setVoiceMessage("");
     requestAnimationFrame(() => {
-      console.info("[ONBOARDING START TIMING] chat_shell_visible_ms", Math.round(performance.now() - clickedAt));
+      console.info("[ONBOARDING START TIMING] chat_shell_visible_ms", Math.round(performance.now() - startedAt));
     });
     try {
       const requestStartedAt = performance.now();
       const data = await onboardingRequest("/sessions", { method: "POST" });
       const sessionReceivedAt = performance.now();
       console.info("[ONBOARDING START TIMING] session_request_ms", Math.round(sessionReceivedAt - requestStartedAt));
-      console.info("[ONBOARDING START TIMING] click_to_session_ms", Math.round(sessionReceivedAt - clickedAt));
+      console.info("[ONBOARDING START TIMING] entry_to_session_ms", Math.round(sessionReceivedAt - startedAt));
       setSessionId(data.id);
       setProfile(data.profile);
       const firstReply = typeof data.assistant_reply === "string" && data.assistant_reply.trim()
         ? data.assistant_reply
         : greeting;
       firstAssistantTimingRef.current = sessionReceivedAt;
-      setConversationMessages([{ role: "assistant", content: firstReply, sentAt: data.assistant_sent_at }]);
+      setConversationMessages(current => [
+        { role: "assistant", content: firstReply, sentAt: data.assistant_sent_at },
+        ...current.filter(message => message.role === "system"),
+      ]);
       setUploadedDocuments([]);
       setAssistantReply(firstReply);
       if (modeRef.current === "voice") speakText(firstReply);
@@ -341,7 +365,6 @@ export default function VoiceOnboarding({
       transcriptRef.current = "";
       setResearch([]);
       setAssociatedAgentId(null);
-      setProfileDirty(false);
       setConsented(true);
       setVoiceMessage("Onboarding is ready. Start speaking when you are.");
     } catch (error) {
@@ -351,6 +374,10 @@ export default function VoiceOnboarding({
       setIsStarting(false);
     }
   };
+
+  useEffect(() => {
+    if (active && !resumeSessionId) void beginOnboarding();
+  }, [active, resumeSessionId]);
 
   const resumeOnboarding = async (id: string) => {
     if (resumeSessionInFlightRef.current === id) return;
@@ -368,7 +395,6 @@ export default function VoiceOnboarding({
     transcriptRef.current = "";
     setAssistantReply("");
     setResearch([]);
-    setProfileDirty(false);
     endedRef.current = false;
     try {
       const data = await onboardingRequest(`/sessions/${id}`);
@@ -389,12 +415,14 @@ export default function VoiceOnboarding({
       setCompletionRecorded(Boolean(data.completion_recorded));
       setTranscript("");
       transcriptRef.current = "";
-      setConversationMessages(savedMessages);
+      setConversationMessages(current => [
+        ...savedMessages,
+        ...current.filter(message => message.role === "system"),
+      ]);
       setUploadedDocuments(data.documents || []);
       setAssistantReply(latestAssistantReply);
       setResearch(data.research || []);
       setAssociatedAgentId(data.agent_id || null);
-      setProfileDirty(false);
       endedRef.current = false;
       setIsEnded(false);
       setConsented(true);
@@ -420,44 +448,20 @@ export default function VoiceOnboarding({
     }
   }, [active, resumeSessionId, sessionId]);
 
-  const updateProfileField = (field: typeof editableProfileFields[number], value: string) => {
-    setProfile(current => {
-      if (!current) return current;
-      const parsedValue = listProfileFields.has(field)
-        ? value.split("\n").map(item => item.trim()).filter(Boolean)
-        : value.trim() || null;
-      return { ...current, [field]: parsedValue };
-    });
-    setProfileDirty(true);
-  };
-
   const createAgent = async () => {
     if (!sessionId || !profile || creationInFlightRef.current) return;
     creationInFlightRef.current = true;
-    setIsSavingReview(true);
+    setIsCreatingAgent(true);
     setVoiceMessage("");
     try {
-      const payload = Object.fromEntries(
-        editableProfileFields.map(field => [field, profile[field]]),
-      );
-      const reviewed = await onboardingRequest(`/sessions/${sessionId}/profile`, {
-        method: "PATCH",
-        body: JSON.stringify(payload),
-      });
-      setProfile(reviewed.profile);
-      setCompletionRecorded(Boolean(reviewed.completion_recorded));
-      setProfileDirty(false);
-      const fields = {
-        ...reviewed.agent_fields,
-        ...await onboardingRequest(`/sessions/${sessionId}/agent-fields`, { method: "POST" }),
-      };
-      const agent = await onCreateAgent(sessionId, fields, reviewed.profile, associatedAgentId);
+      const fields = await onboardingRequest(`/sessions/${sessionId}/agent-fields`, { method: "POST" });
+      const agent = await onCreateAgent(sessionId, fields, profile, associatedAgentId);
       setAssociatedAgentId(agent.id);
     } catch (error) {
       setVoiceMessage(error instanceof Error ? error.message : "The reviewed profile could not be saved.");
     } finally {
       creationInFlightRef.current = false;
-      setIsSavingReview(false);
+      setIsCreatingAgent(false);
     }
   };
 
@@ -477,7 +481,7 @@ export default function VoiceOnboarding({
     try {
       const data = await onboardingRequest(`/sessions/${sessionId}/turns`, {
         method: "POST",
-        body: JSON.stringify({ text: normalizedText, sent_at: sentAt }),
+        body: JSON.stringify({ text: normalizedText, sent_at: sentAt, mode: submittedMode }),
       });
       setProfile(data.profile);
       setCompletionRecorded(Boolean(data.completion_recorded));
@@ -501,7 +505,6 @@ export default function VoiceOnboarding({
         ) {
           speakText(data.assistant_reply);
         }
-        setVoiceMessage("Your profile is updated.");
       } else {
         setVoiceMessage("Your answer was saved, but no reply was returned. You can continue or resume this session later.");
       }
@@ -602,7 +605,7 @@ export default function VoiceOnboarding({
       try {
         const data = await onboardingRequest(`/sessions/${sessionId}`);
         if (active) {
-          if (!profileDirty) setProfile(data.profile);
+          setProfile(data.profile);
           setCompletionRecorded(Boolean(data.completion_recorded));
           setResearch(data.research || []);
           setAssociatedAgentId(data.agent_id || null);
@@ -618,7 +621,7 @@ export default function VoiceOnboarding({
       active = false;
       window.clearInterval(timer);
     };
-  }, [sessionId, research, profileDirty]);
+  }, [sessionId, research]);
 
   const startListening = () => {
     if (!Recognition || isEnded || !consented || !sessionId) return;
@@ -689,7 +692,7 @@ export default function VoiceOnboarding({
 
   return (
     <main className="min-h-[calc(100vh-3.5rem)] bg-background px-0 py-0 text-foreground sm:px-5 sm:py-5" style={{ fontFamily: "DM Sans, sans-serif" }}>
-      <section className="mx-auto flex min-h-[calc(100vh-3.5rem)] w-full max-w-5xl flex-col overflow-hidden bg-card shadow-sm sm:min-h-[calc(100vh-6rem)] sm:rounded-xl sm:border sm:border-border">
+      <section className="mx-auto flex min-h-[calc(100vh-3.5rem)] w-full max-w-3xl flex-col overflow-hidden bg-card shadow-sm sm:min-h-[calc(100vh-6rem)] sm:rounded-xl sm:border sm:border-border">
         <header className="flex shrink-0 items-center justify-between gap-3 border-b border-[#1e3a8a] bg-[#172554] px-4 py-3 text-white sm:px-6">
           <div className="flex min-w-0 items-center gap-3">
             <img src="/favicon.svg" alt="VoxAgent" className="h-11 w-11 shrink-0 rounded-full bg-white object-contain" />
@@ -736,21 +739,27 @@ export default function VoiceOnboarding({
               aria-label="Conversation"
             >
               {conversationMessages.map((message, index) => (
-                <div key={`${index}-${message.role}`} className={`flex items-start gap-2 ${message.role === "user" ? "justify-end" : "justify-start"}`}>
-                  {message.role === "assistant" && <img src="/favicon.svg" alt="" className="mt-1 h-7 w-7 shrink-0 rounded-full bg-[#dbeafe] object-contain" />}
-                  <div
-                    className={`w-fit max-w-[88%] rounded-xl border px-3.5 py-2.5 shadow-sm sm:max-w-[75%] sm:px-4 ${message.role === "user"
-                      ? "rounded-tr-sm border-[#bfdbfe] bg-[#dbeafe] text-[#172554]"
-                      : "rounded-tl-sm border-white bg-white text-[#172554]"}`}
-                  >
-                    <p className="whitespace-pre-wrap break-words text-sm leading-6">{message.content}</p>
-                    <p className="mt-1 text-right text-[10px] text-slate-600">
-                      {[message.role === "assistant" ? "VoxAgent" : "", message.sentAt
-                        ? new Date(message.sentAt).toLocaleString([], { dateStyle: "short", timeStyle: "short" })
-                        : ""].filter(Boolean).join(" · ")}
-                    </p>
+                message.role === "system" ? (
+                  <div key={`${index}-${message.role}`} className="flex justify-center py-1" role="status">
+                    <p className="rounded-full bg-[#d6d3d1]/90 px-3 py-1 text-xs text-[#475569] shadow-sm">{message.content}</p>
                   </div>
-                </div>
+                ) : (
+                  <div key={`${index}-${message.role}`} className={`flex items-start gap-2 ${message.role === "user" ? "justify-end" : "justify-start"}`}>
+                    {message.role === "assistant" && <img src="/favicon.svg" alt="" className="mt-1 h-7 w-7 shrink-0 rounded-full bg-[#dbeafe] object-contain" />}
+                    <div
+                      className={`w-fit max-w-[88%] rounded-xl border px-3.5 py-2.5 shadow-sm sm:max-w-[75%] sm:px-4 ${message.role === "user"
+                        ? "rounded-tr-sm border-[#bfdbfe] bg-[#dbeafe] text-[#172554]"
+                        : "rounded-tl-sm border-white bg-white text-[#172554]"}`}
+                    >
+                      <p className="whitespace-pre-wrap break-words text-sm leading-6">{message.content}</p>
+                      <p className="mt-1 text-right text-[10px] text-slate-600">
+                        {[message.role === "assistant" ? "VoxAgent" : "", message.sentAt
+                          ? new Date(message.sentAt).toLocaleString([], { dateStyle: "short", timeStyle: "short" })
+                          : ""].filter(Boolean).join(" · ")}
+                      </p>
+                    </div>
+                  </div>
+                )
               ))}
 
               {!sessionId && isStarting && (
@@ -785,7 +794,7 @@ export default function VoiceOnboarding({
 
               {isProcessing && (
                 <div className="mr-auto w-fit rounded-xl rounded-tl-sm border border-white bg-white px-4 py-3 text-xs text-slate-600 shadow-sm" role="status">
-                  Updating your profile...
+                  The council is deciding your fate...
                 </div>
               )}
             </div>
@@ -857,63 +866,17 @@ export default function VoiceOnboarding({
             </div>
           )}
 
-            {!consented ? (
-              <div className="flex flex-1 items-center justify-center px-4 py-10">
-                <button
-                  type="button"
-                  onClick={beginOnboarding}
-                  disabled={isStarting}
-                  className="min-w-40 rounded-md bg-[#1d4ed8] px-8 py-4 text-base font-semibold text-white shadow-lg transition-colors hover:bg-[#1e40af] disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {isStarting ? "Starting..." : "Start"}
-                </button>
-              </div>
-            ) : (
+            {consented && (
               <>
-                {profile && completionRecorded && (
-                  <section className="mx-3 mb-4 rounded-lg border border-[#93c5fd] bg-[#eaf6ff] p-4 text-[#102a43] shadow-sm sm:mx-5 sm:p-5" aria-label="Business profile">
-                    <h2 className="text-sm font-semibold text-[#102a43]">Review agent profile</h2>
-                    <p className="mt-1 text-xs text-[#334e68]">Correct any details before they are used to configure the agent.</p>
-                    <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                      {editableProfileFields.map(field => {
-                        const value = profile[field];
-                        const label = field.replace(/_/g, " ").replace(/^./, (char: string) => char.toUpperCase());
-                        const textValue = Array.isArray(value) ? value.join("\n") : value || "";
-                        return (
-                          <label key={field} className="text-xs capitalize text-[#24415f]">
-                            {label}
-                            {listProfileFields.has(field) ? (
-                              <textarea
-                                rows={2}
-                                value={textValue}
-                                onChange={event => updateProfileField(field, event.target.value)}
-                                className="mt-1 block w-full rounded-md border border-[#93c5fd] bg-white px-3 py-2 text-sm normal-case text-[#102a43] outline-none placeholder:text-[#627d98] focus:border-[#0284c7] focus:ring-2 focus:ring-[#7dd3fc]"
-                              />
-                            ) : (
-                              <input
-                                value={textValue}
-                                onChange={event => updateProfileField(field, event.target.value)}
-                                className="mt-1 block w-full rounded-md border border-[#93c5fd] bg-white px-3 py-2 text-sm normal-case text-[#102a43] outline-none placeholder:text-[#627d98] focus:border-[#0284c7] focus:ring-2 focus:ring-[#7dd3fc]"
-                              />
-                            )}
-                          </label>
-                        );
-                      })}
-                    </div>
-                    {profile.unresolved_questions.length > 0 && <p className="mt-3 text-xs text-[#334e68]">Open details: {profile.unresolved_questions.join(" · ")}</p>}
-                    {profile.conflicts.length > 0 && <p className="mt-2 text-xs text-[#b42318]">Conflicting statements: {profile.conflicts.map(conflict => conflict.statement).join(" · ")}</p>}
-                  </section>
-                )}
-
                 {profile && completionRecorded && (
                   <div className="mx-3 mb-4 rounded-lg border border-[#93c5fd] bg-[#dbeeff] px-4 py-3 sm:mx-5">
                     <button
                       type="button"
                       onClick={() => void createAgent()}
-                      disabled={isSavingReview || (!completionRecorded && !associatedAgentId)}
+                      disabled={isCreatingAgent || (!completionRecorded && !associatedAgentId)}
                       className="rounded-md bg-[#0284c7] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#0369a1] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0284c7] focus-visible:ring-offset-2 focus-visible:ring-offset-[#dbeeff] disabled:cursor-not-allowed disabled:opacity-50"
                     >
-                      {isSavingReview ? "Saving profile..." : associatedAgentId ? "Save profile and choose voice" : "Confirm profile and choose voice"}
+                      {isCreatingAgent ? "Preparing agent..." : associatedAgentId ? "Save profile and choose voice" : "Confirm profile and choose voice"}
                     </button>
                   </div>
                 )}
@@ -956,7 +919,6 @@ export default function VoiceOnboarding({
                   </button>
                 </div>
               )}
-              <p className="max-w-2xl text-center text-xs text-[#64748b]">Browser speech recognition may use its own service. Only recognized text is sent for onboarding; microphone audio is not uploaded.</p>
             </div>
         </div>
       </section>

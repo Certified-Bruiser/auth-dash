@@ -1881,8 +1881,8 @@ function TestStep({ form, agentId, accessToken, showConfiguredGreeting = true, a
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-2 text-xs text-blue-100" role="status">
-            {isProcessing ? <span className="h-2 w-2 animate-pulse rounded-full bg-chart-5" /> : <span className={`h-2 w-2 rounded-full ${sessionActive ? "bg-blue-300" : "bg-blue-100/50"}`} />}
-            <span className="hidden text-[11px] sm:inline sm:text-xs">{isProcessing ? "Responding" : sessionActive ? "Active" : "Ready"}</span>
+            {isRecording ? <span className="h-2 w-2 animate-pulse rounded-full bg-[#dc2626]" /> : isProcessing ? <span className="h-2 w-2 animate-pulse rounded-full bg-chart-5" /> : <span className={`h-2 w-2 rounded-full ${sessionActive ? "bg-blue-300" : "bg-blue-100/50"}`} />}
+            <span className={isRecording ? "text-[11px] sm:text-xs" : "hidden text-[11px] sm:inline sm:text-xs"}>{isRecording ? "Listening" : isProcessing ? "Responding" : sessionActive ? "Active" : "Ready"}</span>
           </div>
         </header>
 
@@ -1911,7 +1911,7 @@ function TestStep({ form, agentId, accessToken, showConfiguredGreeting = true, a
                       </div>
                     )}
                     <p className="mt-1 text-right text-[10px] text-slate-600">
-                      {[msg.role === "agent" ? "VoxAgent" : "", new Date(msg.timestamp).toLocaleString([], { dateStyle: "short", timeStyle: "short" })].filter(Boolean).join(" · ")}
+                      {[msg.role === "agent" ? "Agent" : "", new Date(msg.timestamp).toLocaleString([], { dateStyle: "short", timeStyle: "short" })].filter(Boolean).join(" · ")}
                     </p>
                   </div>
                 </div>
@@ -4314,13 +4314,15 @@ if (!session) {
               onClick={handleCreatePromptAgent}
               className="rounded-lg border border-[rgba(99,102,241,0.2)] bg-[#111520] px-4 py-3 text-left text-sm font-semibold text-[#e2e4ef] transition-colors hover:border-[#6366f1] hover:bg-[rgba(99,102,241,0.12)]"
             >
-              Prompt Mode
+              <span className="block">Prompt Mode</span>
+              <span className="mt-1 block text-xs font-normal text-[#8b8da3]">Build your agent by defining its instructions, behavior, and capabilities.</span>
             </button>
             <button
               onClick={handleCreateVoiceAgent}
               className="rounded-lg border border-[rgba(99,102,241,0.2)] bg-[#111520] px-4 py-3 text-left text-sm font-semibold text-[#e2e4ef] transition-colors hover:border-[#6366f1] hover:bg-[rgba(99,102,241,0.12)]"
             >
-              Voice Agent Mode
+              <span className="block">Voice Mode</span>
+              <span className="mt-1 block text-xs font-normal text-[#8b8da3]">Create your agent through a natural voice conversation, without writing prompts manually.</span>
             </button>
           </div>
         </DialogContent>
